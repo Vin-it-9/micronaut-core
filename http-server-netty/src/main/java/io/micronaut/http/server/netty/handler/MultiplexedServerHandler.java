@@ -110,6 +110,18 @@ abstract class MultiplexedServerHandler {
         private boolean closed;
         private Compressor. @Nullable Session compressionSession;
 
+        /**
+         * The response status captured when the response is written, for the
+         * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
+         */
+        io.micronaut.http. @Nullable HttpStatus capturedStatus;
+
+        /**
+         * Accumulated response body bytes (post-compression), for the
+         * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
+         */
+        long bytesWritten;
+
         MultiplexedStream(int streamId) {
             if (NativeImageUtils.JFR_AVAILABLE && Http2RequestEvent.isTurnedOn()) {
                 jfrEvent = new Http2RequestEvent();
@@ -318,7 +330,7 @@ abstract class MultiplexedServerHandler {
             }
             finished = true;
             disposeWriteSide();
-            requestHandler.responseWritten(attachment);
+            requestHandler.responseWritten(attachment, capturedStatus, bytesWritten);
             return true;
         }
 
@@ -345,6 +357,7 @@ abstract class MultiplexedServerHandler {
             }
 
             NettyByteBodyFactory byteBodyFactory = byteBodyFactory();
+            capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
             if (body instanceof AvailableByteBody available) {
                 writeFull(response, NettyByteBodyFactory.toByteBuf(available));
             } else {
@@ -471,6 +484,7 @@ abstract class MultiplexedServerHandler {
                 compressionSession.finish();
                 ByteBuf compressed = compressionSession.poll();
                 if (compressed != null) {
+                    bytesWritten += compressed.readableBytes();
                     writeData0(compressed, false, requiredCtx().voidPromise());
                 }
             }
@@ -525,6 +539,8 @@ abstract class MultiplexedServerHandler {
                 return;
             }
 
+            capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
+
             boolean empty = !content.isReadable();
 
             if (!empty) {
@@ -541,8 +557,9 @@ abstract class MultiplexedServerHandler {
 
             writeHeaders(response, empty, empty ? endPromise(response) : requiredCtx().voidPromise());
             if (!empty) {
+                bytesWritten += Objects.requireNonNull(content).readableBytes();
                 // bypass writeDataCompressing
-                writeData0(Objects.requireNonNull(content), true, endPromise(response));
+                writeData0(content, true, endPromise(response));
             } else if (content != null) {
                 content.release();
             }
@@ -617,6 +634,7 @@ abstract class MultiplexedServerHandler {
 
         private void writeData(ByteBuf data, boolean endStream, ChannelPromise promise) {
             if (compressionSession == null) {
+                bytesWritten += data.readableBytes();
                 writeData0(data, endStream, promise);
             } else {
                 writeDataCompressing(compressionSession, data, endStream, promise);
@@ -629,6 +647,9 @@ abstract class MultiplexedServerHandler {
                 compressionChannel.finish();
             }
             ByteBuf compressed = compressionChannel.poll();
+            if (compressed != null) {
+                bytesWritten += compressed.readableBytes();
+            }
             if (compressed == null) {
                 if (endStream) {
                     writeData0(Unpooled.EMPTY_BUFFER, true, promise);
