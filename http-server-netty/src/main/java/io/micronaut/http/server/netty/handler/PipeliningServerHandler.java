@@ -19,6 +19,7 @@ import io.micronaut.buffer.netty.NettyReadBufferFactory;
 import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.io.buffer.ReadBuffer;
 import io.micronaut.core.util.NativeImageUtils;
+import io.micronaut.http.HttpStatus;
 import io.micronaut.http.body.AvailableByteBody;
 import io.micronaut.http.body.ByteBody;
 import io.micronaut.http.body.CloseableByteBody;
@@ -1238,6 +1239,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
             }
             preprocess(response);
             FullOutboundHandler oh = new FullOutboundHandler(this, response);
+            oh.capturedStatus = safeStatusOf(response.status().code());
             if (response.content().isReadable()) {
                 prepareCompression(response, oh, response.content().readableBytes());
             }
@@ -1271,6 +1273,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
                 }
                 preprocess(response);
                 StreamingOutboundHandler oh = new StreamingOutboundHandler(this, response);
+                oh.capturedStatus = safeStatusOf(response.status().code());
                 prepareCompression(response, oh, expectedLength.orElse(-1));
                 StreamingNettyByteBody streaming = byteBodyFactory().toStreaming(body);
                 oh.body = streaming;
@@ -1316,6 +1319,18 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
          */
         private boolean responseWritten = false;
 
+        /**
+         * The response status captured when the response is written, for the
+         * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
+         */
+        @Nullable HttpStatus capturedStatus;
+
+        /**
+         * Accumulated response body bytes (post-compression), for the
+         * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
+         */
+        long bytesWritten;
+
         private OutboundHandler(OutboundAccessImpl outboundAccess) {
             this.outboundAccess = outboundAccess;
         }
@@ -1328,7 +1343,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
         final void markResponseWritten() {
             if (!responseWritten) {
                 responseWritten = true;
-                requestHandler.responseWritten(outboundAccess.attachment);
+                requestHandler.responseWritten(outboundAccess.attachment, capturedStatus, bytesWritten);
             }
         }
 
@@ -1338,6 +1353,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
 
         protected final void writeCompressing(HttpContent content, @SuppressWarnings("SameParameterValue") boolean flush, boolean last) {
             if (this.compressionSession == null) {
+                bytesWritten += content.content().readableBytes();
                 writePotentialEnd(content, flush, shouldCloseAfterContent(last));
             } else {
                 // slow path
@@ -1378,6 +1394,9 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
             }
             boolean close = shouldCloseAfterContent(last);
             ByteBuf toSend = compressionSession.poll();
+            if (toSend != null) {
+                bytesWritten += toSend.readableBytes();
+            }
             // send the compressed buffer with the flags.
             if (toSend == null) {
                 if (last) {
