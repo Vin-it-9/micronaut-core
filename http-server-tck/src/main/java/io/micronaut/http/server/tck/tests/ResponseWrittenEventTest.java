@@ -195,7 +195,7 @@ public class ResponseWrittenEventTest {
         io.micronaut.http.HttpRequest<?> request,
         HttpStatus status,
         long bytesWritten
-    ) {}
+    ) { }
 
     @Controller("/response-written")
     @Requires(property = "spec.name", value = SPEC_NAME)

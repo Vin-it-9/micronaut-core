@@ -28,6 +28,7 @@ import io.micronaut.http.ByteBodyHttpResponseWrapper;
 import io.micronaut.http.HttpMethod;
 import io.micronaut.http.HttpRequest;
 import io.micronaut.http.HttpResponse;
+import io.micronaut.http.HttpStatus;
 import io.micronaut.http.UpgradedHttpResponse;
 import io.micronaut.http.body.CloseableByteBody;
 import io.micronaut.http.body.MessageBodyHandlerRegistry;
@@ -252,7 +253,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
     }
 
     @Override
-    public void responseWritten(@Nullable Object attachment, @Nullable io.micronaut.http.HttpStatus status, long bytesWritten) {
+    public void responseWritten(@Nullable Object attachment, @Nullable HttpStatus status, long bytesWritten) {
         if (hasResponseWrittenListeners && attachment != null) {
             NettyHttpRequest<?> request = (NettyHttpRequest<?>) attachment;
             try {
