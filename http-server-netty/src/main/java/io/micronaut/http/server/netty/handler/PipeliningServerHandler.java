@@ -19,6 +19,7 @@ import io.micronaut.buffer.netty.NettyReadBufferFactory;
 import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.io.buffer.ReadBuffer;
 import io.micronaut.core.util.NativeImageUtils;
+import io.micronaut.http.HttpStatus;
 import io.micronaut.http.body.AvailableByteBody;
 import io.micronaut.http.body.ByteBody;
 import io.micronaut.http.body.CloseableByteBody;
@@ -1238,7 +1239,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
             }
             preprocess(response);
             FullOutboundHandler oh = new FullOutboundHandler(this, response);
-            oh.capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
+            oh.capturedStatus = safeStatusOf(response.status().code());
             if (response.content().isReadable()) {
                 prepareCompression(response, oh, response.content().readableBytes());
             }
@@ -1272,7 +1273,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
                 }
                 preprocess(response);
                 StreamingOutboundHandler oh = new StreamingOutboundHandler(this, response);
-                oh.capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
+                oh.capturedStatus = safeStatusOf(response.status().code());
                 prepareCompression(response, oh, expectedLength.orElse(-1));
                 StreamingNettyByteBody streaming = byteBodyFactory().toStreaming(body);
                 oh.body = streaming;
@@ -1322,7 +1323,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
          * The response status captured when the response is written, for the
          * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
          */
-        io.micronaut.http. @Nullable HttpStatus capturedStatus;
+        @Nullable HttpStatus capturedStatus;
 
         /**
          * Accumulated response body bytes (post-compression), for the

@@ -16,11 +16,11 @@
 package io.micronaut.http.server.netty.handler;
 
 import io.micronaut.core.annotation.Internal;
+import io.micronaut.http.HttpStatus;
 import io.micronaut.http.body.CloseableByteBody;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.HttpRequest;
 import org.jspecify.annotations.Nullable;
-import io.micronaut.http.HttpStatus;
 
 /**
  * Handler for incoming requests.
