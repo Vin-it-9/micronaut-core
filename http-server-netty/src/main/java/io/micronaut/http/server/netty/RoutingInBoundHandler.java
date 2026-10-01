@@ -34,6 +34,7 @@ import io.micronaut.http.body.MessageBodyHandlerRegistry;
 import io.micronaut.http.context.ServerHttpRequestContext;
 import io.micronaut.http.context.event.HttpRequestReceivedEvent;
 import io.micronaut.http.context.event.HttpRequestTerminatedEvent;
+import io.micronaut.http.context.event.HttpResponseWrittenEvent;
 import io.micronaut.http.netty.NettyMutableHttpResponse;
 import io.micronaut.http.netty.body.NettyByteBodyFactory;
 import io.micronaut.http.server.netty.websocket.NettyServerWebSocketUpgradeHandler;
@@ -128,6 +129,12 @@ public final class RoutingInBoundHandler implements RequestHandler {
      */
     boolean supportLoggingHandler = false;
     private final ApplicationContext applicationContext;
+    private final ApplicationEventPublisher<HttpResponseWrittenEvent> responseWrittenPublisher;
+    /**
+     * Cached result of {@code !responseWrittenPublisher.isEmpty()}. When {@code false}, byte
+     * counting and event publication are skipped entirely — the feature adds zero cost.
+     */
+    private final boolean hasResponseWrittenListeners;
     /**
      * Decides whether a {@link HttpRequestTerminatedEvent} has to be published for a request.
      * Resolved on first use, see {@link #resolveTerminatedEventFilter()}.
@@ -141,6 +148,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
      * @param requestEventExecutor              The request event executor supplier, must be memoized
      * @param terminateEventPublisher           The terminate event publisher
      * @param receivedPublisher                 The received publisher
+     * @param responseWrittenPublisher          The response written event publisher
      * @param conversionService                 The conversion service
      */
     RoutingInBoundHandler(
@@ -149,7 +157,9 @@ public final class RoutingInBoundHandler implements RequestHandler {
         Supplier<ExecutorService> ioExecutor,
         Supplier<Executor> requestEventExecutor,
         ApplicationEventPublisher<HttpRequestTerminatedEvent> terminateEventPublisher,
-        ApplicationEventPublisher<HttpRequestReceivedEvent> receivedPublisher, ConversionService conversionService) {
+        ApplicationEventPublisher<HttpRequestReceivedEvent> receivedPublisher,
+        ApplicationEventPublisher<HttpResponseWrittenEvent> responseWrittenPublisher,
+        ConversionService conversionService) {
         this.staticResourceResolver = embeddedServerContext.getStaticResourceResolver();
         this.messageBodyHandlerRegistry = embeddedServerContext.getMessageBodyHandlerRegistry();
         // Memoization (thread-safe, lazy, evaluated at most once) is done by the caller via SupplierUtil.memoized
@@ -159,6 +169,8 @@ public final class RoutingInBoundHandler implements RequestHandler {
         this.serverConfiguration = serverConfiguration;
         this.terminateEventPublisher = terminateEventPublisher;
         this.receivedPublisher = receivedPublisher;
+        this.responseWrittenPublisher = responseWrittenPublisher;
+        this.hasResponseWrittenListeners = !responseWrittenPublisher.isEmpty();
         Optional<Boolean> isMultiPartEnabled = serverConfiguration.getMultipart().getEnabled();
         this.multipartEnabled = isMultiPartEnabled.isEmpty() || isMultiPartEnabled.get();
         this.routeExecutor = embeddedServerContext.getRouteExecutor();
@@ -237,6 +249,22 @@ public final class RoutingInBoundHandler implements RequestHandler {
             }
             cleanupRequest(request);
         }
+    }
+
+    @Override
+    public void responseWritten(@Nullable Object attachment, @Nullable io.micronaut.http.HttpStatus status, long bytesWritten) {
+        if (hasResponseWrittenListeners && attachment != null) {
+            NettyHttpRequest<?> request = (NettyHttpRequest<?>) attachment;
+            try {
+                responseWrittenPublisher.publishEvent(
+                    new HttpResponseWrittenEvent(request, status, bytesWritten));
+            } catch (Exception e) {
+                if (LOG.isErrorEnabled()) {
+                    LOG.error("Error publishing response written event: {}", e.getMessage(), e);
+                }
+            }
+        }
+        responseWritten(attachment);
     }
 
     @Override
