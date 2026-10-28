@@ -270,6 +270,9 @@ public final class RoutingInBoundHandler implements RequestHandler {
             }
         }
         responseWritten(attachment);
+    }
+
+    @Override
     public void responseFailed(@Nullable Object attachment, Throwable cause) {
         if (attachment != null) {
             ((NettyHttpRequest<?>) attachment).responseFailed(cause);

@@ -16,8 +16,6 @@
 package io.micronaut.http.server.netty.handler;
 
 import io.micronaut.core.annotation.Internal;
-import io.micronaut.core.io.buffer.ReadBuffer;
-import io.micronaut.core.util.NativeImageUtils;
 import io.micronaut.http.HttpStatus;
 import io.micronaut.http.body.AvailableByteBody;
 import io.micronaut.http.body.ByteBody;
@@ -283,6 +281,21 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
         // for a version where keep-alive is the default this sets `connection: close`, for one
         // where closing is the default it removes a contradicting `connection: keep-alive`
         HttpUtil.setKeepAlive(message, false);
+    }
+
+    /**
+     * Convert a response status code to a {@link HttpStatus}, or {@code null} if the code is not
+     * one of the registered statuses.
+     *
+     * @param code The status code
+     * @return The status, or {@code null}
+     */
+    private static @Nullable HttpStatus safeStatusOf(int code) {
+        try {
+            return HttpStatus.valueOf(code);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /**
@@ -1622,16 +1635,9 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
                 } else {
                     response.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
                 }
-            } else {
-                response.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
-            }
-            preprocess(response);
-            FullOutboundHandler oh = new FullOutboundHandler(this, response);
-            oh.capturedStatus = safeStatusOf(response.status().code());
-            if (response.content().isReadable()) {
-                prepareCompression(response, oh, response.content().readableBytes());
                 preprocess(response);
                 oh = new FullOutboundHandler(this, response);
+                oh.capturedStatus = safeStatusOf(response.status().code());
                 if (response.content().isReadable()) {
                     prepareCompression(response, oh, response.content().readableBytes());
                 }
@@ -1720,12 +1726,6 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
         Compressor. @Nullable Session compressionSession;
 
         /**
-         * {@code true} iff {@link RequestHandler#responseWritten} has been called for this
-         * response already.
-         */
-        private boolean responseWritten = false;
-
-        /**
          * The response status captured when the response is written, for the
          * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
          */
@@ -1736,6 +1736,12 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter 
          * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
          */
         long bytesWritten;
+
+        /**
+         * {@code true} iff {@link RequestHandler#responseWritten} has been called for this
+         * response already.
+         */
+        private boolean responseWritten = false;
 
         private OutboundHandler(OutboundAccessImpl outboundAccess) {
             this.outboundAccess = outboundAccess;

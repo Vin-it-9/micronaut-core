@@ -17,6 +17,7 @@ package io.micronaut.http.server.netty.handler;
 
 import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.io.buffer.ReadBuffer;
+import io.micronaut.http.HttpStatus;
 import io.micronaut.http.body.AvailableByteBody;
 import io.micronaut.http.body.ByteBody;
 import io.micronaut.http.body.stream.BodySizeLimits;
@@ -187,13 +188,13 @@ abstract class MultiplexedServerHandler {
          * The response status captured when the response is written, for the
          * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
          */
-        io.micronaut.http. @Nullable HttpStatus capturedStatus;
+        private @Nullable HttpStatus capturedStatus;
 
         /**
          * Accumulated response body bytes (post-compression), for the
          * {@link io.micronaut.http.context.event.HttpResponseWrittenEvent}.
          */
-        long bytesWritten;
+        private long bytesWritten;
 
         MultiplexedStream(int streamId) {
             if (JfrSupport.isRecorderInitialized() && Http2RequestEvent.isTurnedOn()) {
@@ -542,7 +543,7 @@ abstract class MultiplexedServerHandler {
             }
 
             NettyByteBodyFactory byteBodyFactory = byteBodyFactory();
-            capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
+            capturedStatus = HttpStatus.valueOf(response.status().code());
             if (body instanceof AvailableByteBody available) {
                 writeFull(response, NettyByteBodyFactory.toByteBuf(available));
             } else {
@@ -629,9 +630,8 @@ abstract class MultiplexedServerHandler {
                 return;
             }
 
-            capturedStatus = io.micronaut.http.HttpStatus.valueOf(response.status().code());
+            capturedStatus = HttpStatus.valueOf(response.status().code());
 
-            boolean empty = !content.isReadable();
             // the content that is not handed to the compression or the connection yet
             ByteBuf owned = content;
             try {
@@ -651,19 +651,13 @@ abstract class MultiplexedServerHandler {
                     empty = content == null;
                 }
 
-            writeHeaders(response, empty, empty ? endPromise(response) : requiredCtx().voidPromise());
-            if (!empty) {
-                bytesWritten += Objects.requireNonNull(content).readableBytes();
-                // bypass writeDataCompressing
-                writeData0(content, true, endPromise(response));
-            } else if (content != null) {
-                content.release();
                 headersWritten = true;
                 writeHeaders(response, empty, empty ? endPromise(response) : requiredCtx().voidPromise());
                 owned = null;
                 if (!empty) {
                     // bypass writeDataCompressing
-                    writeData0(Objects.requireNonNull(content), true, endPromise(response));
+                    bytesWritten += Objects.requireNonNull(content).readableBytes();
+                    writeData0(content, true, endPromise(response));
                 } else if (content != null) {
                     content.release();
                 }

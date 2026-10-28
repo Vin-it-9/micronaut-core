@@ -71,6 +71,9 @@ public interface RequestHandler {
      */
     default void responseWritten(@Nullable Object attachment, @Nullable HttpStatus status, long bytesWritten) {
         responseWritten(attachment);
+    }
+
+    /**
      * Called before {@link #responseWritten(Object)} when the body of the response failed while
      * it was written, so that the response ends abruptly.
      *
