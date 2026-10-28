@@ -18,11 +18,14 @@ package io.micronaut.inject.ast;
 import io.micronaut.core.annotation.AnnotationMetadata;
 import io.micronaut.core.annotation.AnnotationValue;
 import io.micronaut.core.annotation.AnnotationValueBuilder;
+import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.reflect.ClassUtils;
 import io.micronaut.inject.ast.annotation.MutableAnnotationMetadataDelegate;
 import org.jspecify.annotations.Nullable;
 
 import java.lang.annotation.Annotation;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -46,6 +49,7 @@ public final class PrimitiveElement implements ArrayableClassElement {
 
     private final String typeName;
     private final int arrayDimensions;
+    private final List<MutableAnnotationMetadataDelegate<AnnotationMetadata>> arrayTypeAnnotations;
     private final String boxedTypeName;
     private final AnnotationMetadata annotationMetadata;
     @Nullable
@@ -75,6 +79,17 @@ public final class PrimitiveElement implements ArrayableClassElement {
                              AnnotationMetadata annotationMetadata,
                              @Nullable MutableAnnotationMetadataDelegate<AnnotationMetadata> typeAnnotationMetadata,
                              @Nullable String doc) {
+        this(name, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc, List.of());
+    }
+
+    private PrimitiveElement(String name,
+                             String boxedTypeName,
+                             int arrayDimensions,
+                             AnnotationMetadata annotationMetadata,
+                             @Nullable MutableAnnotationMetadataDelegate<AnnotationMetadata> typeAnnotationMetadata,
+                             @Nullable String doc,
+                             List<MutableAnnotationMetadataDelegate<AnnotationMetadata>> arrayTypeAnnotations) {
+        this.arrayTypeAnnotations = arrayTypeAnnotations;
         this.typeName = name;
         this.arrayDimensions = arrayDimensions;
         this.boxedTypeName = boxedTypeName;
@@ -147,13 +162,19 @@ public final class PrimitiveElement implements ArrayableClassElement {
     /**
      * The type annotations written on this use of the primitive, such as {@code @A int}, when the element
      * was created for such a use with {@link #withTypeAnnotationMetadata(MutableAnnotationMetadataDelegate)};
-     * they are the same annotations {@link #getAnnotationMetadata()} returns. The shared constants have none.
+     * for a scalar they are the same annotations {@link #getAnnotationMetadata()} returns. An array use
+     * exposes the annotations of its current dimension separately. The shared constants have none.
      *
      * @return The type annotation metadata
      * @since 5.3.0
      */
     @Override
     public MutableAnnotationMetadataDelegate<AnnotationMetadata> getTypeAnnotationMetadata() {
+        if (isArray() && !arrayTypeAnnotations.isEmpty()) {
+            return arrayDimensions <= arrayTypeAnnotations.size()
+                ? arrayTypeAnnotations.get(arrayDimensions - 1)
+                : ArrayableClassElement.super.getTypeAnnotationMetadata();
+        }
         if (typeAnnotationMetadata != null) {
             return typeAnnotationMetadata;
         }
@@ -162,7 +183,22 @@ public final class PrimitiveElement implements ArrayableClassElement {
 
     @Override
     public PrimitiveElement withArrayDimensions(int arrayDimensions) {
-        return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc);
+        return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc, arrayTypeAnnotations);
+    }
+
+    /**
+     * A primitive, and an array of one, has no type arguments, so a copy without any is the element itself, as
+     * {@link #foldBoundGenericTypes(java.util.function.Function)} asks for the {@code int[]} of a {@code List<int[]>}.
+     *
+     * @param typeArguments The type arguments, which must be empty
+     * @return This element
+     */
+    @Override
+    public ClassElement withTypeArguments(Map<String, ClassElement> typeArguments) {
+        if (typeArguments.isEmpty()) {
+            return this;
+        }
+        return ArrayableClassElement.super.withTypeArguments(typeArguments);
     }
 
     /**
@@ -192,11 +228,27 @@ public final class PrimitiveElement implements ArrayableClassElement {
         return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, AnnotationMetadata.EMPTY_METADATA, typeAnnotationMetadata, doc);
     }
 
+    /**
+     * Returns a copy with the annotations of each array dimension, innermost dimension first.
+     * The component's legacy metadata remains available through {@link #getAnnotationMetadata()}.
+     *
+     * @param annotations The dimension annotations
+     * @return The copy
+     * @since 5.3.0
+     */
+    @Internal
+    public PrimitiveElement withArrayTypeAnnotations(List<MutableAnnotationMetadataDelegate<AnnotationMetadata>> annotations) {
+        return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc, List.copyOf(annotations));
+    }
+
     private PrimitiveElement withDoc(String doc) {
-        return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc);
+        return new PrimitiveElement(typeName, boxedTypeName, arrayDimensions, annotationMetadata, typeAnnotationMetadata, doc, arrayTypeAnnotations);
     }
 
     private MutableAnnotationMetadataDelegate<AnnotationMetadata> getAnnotationMetadataToWrite() {
+        if (isArray() && !arrayTypeAnnotations.isEmpty()) {
+            return getTypeAnnotationMetadata();
+        }
         if (typeAnnotationMetadata == null) {
             throw new UnsupportedOperationException("A primitive without type annotations cannot be annotated at compilation time");
         }

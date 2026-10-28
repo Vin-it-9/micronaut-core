@@ -30,6 +30,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpServerUpgradeHandler;
 import io.netty.handler.codec.http.HttpVersion;
@@ -48,6 +49,7 @@ import io.netty.handler.codec.http2.Http2Flags;
 import io.netty.handler.codec.http2.Http2FrameListener;
 import io.netty.handler.codec.http2.Http2FrameLogger;
 import io.netty.handler.codec.http2.Http2Headers;
+import io.netty.handler.codec.http2.Http2RemoteFlowController;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.HttpConversionUtil;
 import io.netty.handler.timeout.IdleState;
@@ -81,6 +83,11 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
      * while response headers are written. Set when the access log is enabled.
      */
     private boolean exposeResponseRequest = false;
+    /**
+     * Flushes requested outside a read are coalesced into one per event loop turn.
+     */
+    @Nullable
+    private FlushCoalescer flushCoalescer;
     /**
      * Streams whose request headers were read since the last read complete, without the end of
      * the stream. These are the only streams that can still need {@link MultiplexedStream#devolveToStreaming()}
@@ -120,7 +127,15 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
                 Http2Stream stream = s.getProperty(key);
                 if (stream != null) {
                     stream.discardBufferedContent();
+                    stream.onStreamClosed();
                 }
+            }
+        });
+        Http2RemoteFlowController remoteFlowController = connectionHandler.encoder().flowController();
+        remoteFlowController.listener(s -> {
+            Http2Stream stream = s.getProperty(key);
+            if (stream != null && remoteFlowController.isWritable(s)) {
+                stream.onOutboundWritable();
             }
         });
     }
@@ -134,8 +149,16 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
         // while reading, hold back flushes for efficiency.
         // Http2ConnectionHandler.readComplete does a flush.
         if (!reading) {
-            requiredConnectionHandler().flush(requiredCtx());
+            Objects.requireNonNull(flushCoalescer, "flushCoalescer").schedule();
         }
+    }
+
+    /**
+     * Perform a flush that was scheduled by the {@link #flushCoalescer}.
+     */
+    private void flushNow() {
+        endTurn();
+        requiredConnectionHandler().flush(requiredCtx());
     }
 
     @Override
@@ -165,7 +188,19 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
             existing.onTrailersRead(trailers, endOfStream);
             return;
         }
-        stream.onHeadersRead(HttpConversionUtil.toHttpRequest(streamId, headers, true), endOfStream);
+        HttpRequest request;
+        try {
+            request = HttpConversionUtil.toHttpRequest(streamId, headers, true);
+        } catch (Http2Exception e) {
+            str.removeProperty(streamKey);
+            throw e;
+        } catch (RuntimeException e) {
+            // e.g. a missing :method or :path pseudo-header. RFC 9113 §8.1.1: a malformed
+            // request is a stream error, it must not fail the other streams of the connection.
+            str.removeProperty(streamKey);
+            throw Http2Exception.streamError(streamId, Http2Error.PROTOCOL_ERROR, e, "Malformed request headers");
+        }
+        stream.onHeadersRead(request, endOfStream);
         if (!endOfStream) {
             pendingStreams.add(stream);
         }
@@ -277,6 +312,7 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
         @Override
         public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
             handler.ctx = ctx;
+            handler.flushCoalescer = new FlushCoalescer(ctx.executor(), handler::flushNow);
             super.handlerAdded(ctx);
             // the preface has been sent if the channel is active, the WINDOW_UPDATE must come after it
             raiseConnectionWindow(ctx);
@@ -304,7 +340,10 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
             handler.devolvePendingStreams();
+            handler.endTurn();
             handler.reading = false;
+            // the superclass flushes now, which also covers a flush scheduled before this read
+            Objects.requireNonNull(handler.flushCoalescer, "flushCoalescer").cancel();
             super.channelReadComplete(ctx);
         }
 
@@ -406,9 +445,17 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
         }
 
         public ConnectionHandlerBuilder compressor(HttpCompressionStrategy compressionStrategy) {
-            if (compressionStrategy.isEnabled()) {
-                frameListener.compressor(new Compressor(compressionStrategy));
-            }
+            return compressor(Compressor.create(compressionStrategy));
+        }
+
+        /**
+         * Set the response compressor. The server shares one instance between its connections.
+         *
+         * @param compressor The compressor, or {@code null} to disable compression
+         * @return This builder
+         */
+        public ConnectionHandlerBuilder compressor(@Nullable Compressor compressor) {
+            frameListener.compressor(compressor);
             return this;
         }
 
@@ -496,6 +543,11 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
         }
 
         @Override
+        boolean isOutboundWritable() {
+            return requiredConnectionHandler().encoder().flowController().isWritable(stream);
+        }
+
+        @Override
         void closeInput() {
             closeInput = true;
             if (stream.state() == io.netty.handler.codec.http2.Http2Stream.State.HALF_CLOSED_LOCAL) {
@@ -514,7 +566,7 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
                 promise = promise.unvoid();
                 promise.addListener(future -> closeInput());
             }
-            Http2Headers http2Headers = HttpConversionUtil.toHttp2Headers(headers, true);
+            Http2Headers http2Headers = toHttp2Headers(headers, promise);
             if (exposeResponseRequest) {
                 Attribute<Object> attribute = requiredCtx().channel().attr(HttpAccessLogHandler.RESPONSE_REQUEST);
                 attribute.set(attachment());
@@ -543,7 +595,29 @@ public final class Http2ServerHandler extends MultiplexedServerHandler implement
                 promise = promise.unvoid();
                 promise.addListener(future -> closeInput());
             }
-            requiredConnectionHandler().encoder().writeHeaders(requiredCtx(), stream.id(), HttpConversionUtil.toHttp2Headers(trailers, true), 0, true, promise);
+            requiredConnectionHandler().encoder().writeHeaders(requiredCtx(), stream.id(), toHttp2Headers(trailers, promise), 0, true, promise);
+        }
+
+        /**
+         * Convert the headers, failing the promise of the write if they cannot be converted, e.g.
+         * with an invalid {@code te} header: the promise never reaches the connection then.
+         */
+        private static Http2Headers toHttp2Headers(HttpResponse response, ChannelPromise promise) {
+            try {
+                return HttpConversionUtil.toHttp2Headers(response, true);
+            } catch (RuntimeException e) {
+                promise.tryFailure(e);
+                throw e;
+            }
+        }
+
+        private static Http2Headers toHttp2Headers(HttpHeaders trailers, ChannelPromise promise) {
+            try {
+                return HttpConversionUtil.toHttp2Headers(trailers, true);
+            } catch (RuntimeException e) {
+                promise.tryFailure(e);
+                throw e;
+            }
         }
     }
 

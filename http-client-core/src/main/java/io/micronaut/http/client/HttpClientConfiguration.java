@@ -16,6 +16,7 @@
 package io.micronaut.http.client;
 
 import io.micronaut.context.env.CachedEnvironment;
+import io.micronaut.core.annotation.Experimental;
 import io.micronaut.core.annotation.Internal;
 import io.micronaut.core.annotation.NextMajorVersion;
 import io.micronaut.http.HttpHeaders;
@@ -148,6 +149,14 @@ public abstract class HttpClientConfiguration {
     public static final boolean DEFAULT_ALLOW_BLOCK_EVENT_LOOP = false;
 
     /**
+     * The default value for {@link #isBlockingCallerStackTrace()}.
+     *
+     * @since 5.3.0
+     */
+    @SuppressWarnings("WeakerAccess")
+    public static final boolean DEFAULT_BLOCKING_CALLER_STACK_TRACE = false;
+
+    /**
      * The default value.
      */
     @SuppressWarnings("WeakerAccess")
@@ -175,6 +184,9 @@ public abstract class HttpClientConfiguration {
 
     @Nullable
     private Duration expectContinueTimeout = Duration.ofSeconds(DEFAULT_EXPECT_CONTINUE_TIMEOUT_SECONDS);
+
+    @Nullable
+    private Duration handshakeTimeout;
 
     @Nullable
     private Duration requestTimeout = null;
@@ -263,6 +275,8 @@ public abstract class HttpClientConfiguration {
 
     private boolean allowBlockEventLoop = DEFAULT_ALLOW_BLOCK_EVENT_LOOP;
 
+    private boolean blockingCallerStackTrace = DEFAULT_BLOCKING_CALLER_STACK_TRACE;
+
     private DnsResolutionMode dnsResolutionMode = DEFAULT_DNS_RESOLUTION_MODE;
 
     @Nullable
@@ -323,6 +337,7 @@ public abstract class HttpClientConfiguration {
             this.connectionPoolIdleTimeout = copy.connectionPoolIdleTimeout;
             this.readTimeout = copy.readTimeout;
             this.expectContinueTimeout = copy.expectContinueTimeout;
+            this.handshakeTimeout = copy.handshakeTimeout;
             this.shutdownTimeout = copy.shutdownTimeout;
             this.shutdownQuietPeriod = copy.shutdownQuietPeriod;
             this.sslConfiguration = copy.sslConfiguration;
@@ -337,6 +352,7 @@ public abstract class HttpClientConfiguration {
                 this.alpnModes = new ArrayList<>(copy.alpnModes);
             }
             this.allowBlockEventLoop = copy.allowBlockEventLoop;
+            this.blockingCallerStackTrace = copy.blockingCallerStackTrace;
             if (copy.dnsResolutionMode != null) {
                 this.dnsResolutionMode = copy.dnsResolutionMode;
             }
@@ -784,6 +800,33 @@ public abstract class HttpClientConfiguration {
     }
 
     /**
+     * How long a WebSocket connect waits for the response to its upgrade request once connected:
+     * a server that does not answer in time fails the connect with a
+     * {@link io.micronaut.http.client.exceptions.ReadTimeoutException}, and the connection is
+     * closed. Empty, the default, to wait without a limit.
+     * [available in the Netty HTTP client]
+     *
+     * @return The WebSocket handshake timeout
+     * @since 5.3.0
+     */
+    @Experimental
+    public Optional<Duration> getHandshakeTimeout() {
+        return Optional.ofNullable(handshakeTimeout);
+    }
+
+    /**
+     * Sets how long a WebSocket connect waits for the response to its upgrade request once
+     * connected. {@code null}, the default, waits without a limit.
+     *
+     * @param handshakeTimeout The WebSocket handshake timeout
+     * @since 5.3.0
+     */
+    @Experimental
+    public void setHandshakeTimeout(@Nullable Duration handshakeTimeout) {
+        this.handshakeTimeout = handshakeTimeout;
+    }
+
+    /**
      * For WebSockets, the {@link #getReadTimeout()} method does not apply instead a configurable
      * idle timeout is applied.
      *
@@ -1132,6 +1175,36 @@ public abstract class HttpClientConfiguration {
     }
 
     /**
+     * Whether exceptions thrown from a {@link BlockingHttpClient} call (including declarative
+     * clients with a synchronous return type) should have their stack trace replaced with the
+     * stack trace of the calling thread. Such exceptions are usually constructed on an event
+     * loop, so by default their stack trace does not mention the code that made the call. When
+     * enabled, the original stack trace is kept as a suppressed exception.
+     *
+     * @return {@code true} if the stack trace of the caller should be used
+     * @since 5.3.0
+     */
+    public boolean isBlockingCallerStackTrace() {
+        return blockingCallerStackTrace;
+    }
+
+    /**
+     * Whether exceptions thrown from a {@link BlockingHttpClient} call (including declarative
+     * clients with a synchronous return type) should have their stack trace replaced with the
+     * stack trace of the calling thread. Such exceptions are usually constructed on an event
+     * loop, so by default their stack trace does not mention the code that made the call. When
+     * enabled, the original stack trace is kept as a suppressed exception.
+     * <br>
+     * Default value: {@value DEFAULT_BLOCKING_CALLER_STACK_TRACE}
+     *
+     * @param blockingCallerStackTrace {@code true} if the stack trace of the caller should be used
+     * @since 5.3.0
+     */
+    public void setBlockingCallerStackTrace(boolean blockingCallerStackTrace) {
+        this.blockingCallerStackTrace = blockingCallerStackTrace;
+    }
+
+    /**
      * Configure how DNS records are resolved. Ignored if {@link #getAddressResolverGroupName()} is
      * non-null. This option is specific to the netty client.
      *
@@ -1239,6 +1312,35 @@ public abstract class HttpClientConfiguration {
         private HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality connectionLocality = ConnectionLocality.PREFERRED;
 
         private PoolVersion version = PoolVersion.V4_9;
+
+        /**
+         * Default constructor.
+         */
+        public ConnectionPoolConfiguration() {
+        }
+
+        /**
+         * Copy constructor.
+         *
+         * @param copy The connection pool configuration to copy
+         */
+        protected ConnectionPoolConfiguration(@Nullable ConnectionPoolConfiguration copy) {
+            if (copy != null) {
+                this.maxPendingConnections = copy.maxPendingConnections;
+                this.maxConcurrentRequestsPerHttp2Connection = copy.maxConcurrentRequestsPerHttp2Connection;
+                this.maxConcurrentHttp1Connections = copy.maxConcurrentHttp1Connections;
+                this.maxConcurrentHttp2Connections = copy.maxConcurrentHttp2Connections;
+                this.maxPendingAcquires = copy.maxPendingAcquires;
+                this.acquireTimeout = copy.acquireTimeout;
+                this.enabled = copy.enabled;
+                if (copy.connectionLocality != null) {
+                    this.connectionLocality = copy.connectionLocality;
+                }
+                if (copy.version != null) {
+                    this.version = copy.version;
+                }
+            }
+        }
 
         /**
          * Whether connection pooling is enabled.

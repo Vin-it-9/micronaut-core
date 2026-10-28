@@ -36,9 +36,12 @@ import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.expressions.context.DefaultExpressionCompilationContextFactory;
 import io.micronaut.expressions.context.ExpressionCompilationContextFactory;
+import io.micronaut.inject.annotation.AnnotationBuilderRegistrations;
 import io.micronaut.inject.ast.ClassElement;
 import io.micronaut.inject.ast.Element;
+import io.micronaut.inject.ast.annotation.AbstractAnnotationElement;
 import io.micronaut.inject.ast.annotation.ElementAnnotationMetadataFactory;
+import io.micronaut.inject.ast.beans.BeanElementBuilder;
 import io.micronaut.inject.visitor.VisitorContext;
 import io.micronaut.inject.visitor.util.VisitorContextUtils;
 import io.micronaut.inject.writer.AbstractBeanDefinitionBuilder;
@@ -231,6 +234,12 @@ public class GroovyVisitorContext implements VisitorContext {
     @Override
     public @NonNull ExpressionCompilationContextFactory getExpressionCompilationContextFactory() {
         return this.expressionCompilationContextFactory;
+    }
+
+    @Override
+    public AnnotationBuilderRegistrations getAnnotationBuilderRegistrations() {
+        // a context is created per source unit and phase, the compilation unit is shared by them
+        return AnnotationBuilderRegistrations.forCompilation(compilationUnit != null ? compilationUnit : sourceUnit);
     }
 
     @Override
@@ -445,6 +454,19 @@ public class GroovyVisitorContext implements VisitorContext {
         final ArrayList<AbstractBeanDefinitionBuilder> current = new ArrayList<>(beanDefinitionBuilders);
         beanDefinitionBuilders.clear();
         return current;
+    }
+
+    @Override
+    public BeanElementBuilder registerBean(ClassElement beanType, Element... originatingElements) {
+        AbstractBeanDefinitionBuilder.requireOriginatingElements(beanType, originatingElements);
+        GroovyBeanDefinitionBuilder builder = new GroovyBeanDefinitionBuilder(
+            originatingElements[0],
+            beanType,
+            beanType instanceof AbstractAnnotationElement annotationElement ? annotationElement.getElementAnnotationMetadataFactory() : elementAnnotationMetadataFactory,
+            this
+        );
+        builder.addOriginatingElements(originatingElements);
+        return builder;
     }
 
     /**

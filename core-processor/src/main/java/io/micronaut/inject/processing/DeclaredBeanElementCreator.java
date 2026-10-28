@@ -83,12 +83,14 @@ sealed class DeclaredBeanElementCreator<R> extends AbstractBeanElementCreator<R>
     private static final String MEMBER_PRE_DESTROY = "preDestroy";
 
     /**
-     * The stereotypes that mark an annotation as interceptor advice.
+     * The stereotypes that mark an annotation as interceptor advice. An annotation declared with more than one
+     * {@code @InterceptorBinding} carries them under their repeatable container rather than as the binding itself.
      */
     private static final List<String> ADVICE_STEREOTYPES = List.of(
         Around.class.getName(),
         Introduction.class.getName(),
-        AnnotationUtil.ANN_INTERCEPTOR_BINDING
+        AnnotationUtil.ANN_INTERCEPTOR_BINDING,
+        AnnotationUtil.ANN_INTERCEPTOR_BINDINGS
     );
 
     protected final boolean isAopProxy;
@@ -569,10 +571,22 @@ sealed class DeclaredBeanElementCreator<R> extends AbstractBeanElementCreator<R>
      * @return true if processed
      */
     protected boolean visitField(ElementBeanDefinitionBuilder<R> beanDefinitionBuilder, FieldElement fieldElement) {
-        if (fieldElement.isStatic() || fieldElement.isFinal()) {
+        if (fieldElement.isStatic()) {
             return false;
         }
         AnnotationMetadata fieldAnnotationMetadata = fieldElement.getAnnotationMetadata();
+        if (fieldElement.isFinal()) {
+            // Records and Kotlin constructor properties copy the parameter annotations to the final backing field
+            if (!classElement.isRecord()
+                && visitorContext.getLanguage() != VisitorContext.Language.KOTLIN
+                && (fieldAnnotationMetadata.hasStereotype(Value.class)
+                || fieldAnnotationMetadata.hasStereotype(Property.class)
+                || fieldAnnotationMetadata.hasStereotype(AnnotationUtil.INJECT))) {
+                throw new ProcessingException(fieldElement, "Cannot inject into final field [" + fieldElement.getName() + "] of ["
+                    + fieldElement.getDeclaringType().getName() + "]: use constructor injection or remove the final modifier");
+            }
+            return false;
+        }
         if (fieldAnnotationMetadata.hasStereotype(Value.class) || fieldAnnotationMetadata.hasStereotype(Property.class)) {
             beanDefinitionBuilder.addFieldPropertyInjection(fieldElement, fieldElement, fieldElement.isReflectionRequired(classElement), visitorContext);
             return true;
@@ -735,6 +749,10 @@ sealed class DeclaredBeanElementCreator<R> extends AbstractBeanElementCreator<R>
             proxyAnnotationMetadata,
             interfaceToAdapt
         );
+        // The proxy name is synthetic and the adapted interface usually comes from a library, so neither ties the
+        // adapter to a source file. Incremental processors drop outputs that originate from no source file.
+        aopProxyWriter.addOriginatingElement(classElement);
+        aopProxyWriter.addOriginatingElement(sourceMethod.getDeclaringType());
         additionalBuilders.add(aopProxyWriter);
 
         aopProxyWriter.implementInterface(interfaceToAdapt);

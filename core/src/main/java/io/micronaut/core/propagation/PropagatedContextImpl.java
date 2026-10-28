@@ -18,15 +18,18 @@ package io.micronaut.core.propagation;
 import io.micronaut.core.annotation.Internal;
 import org.jspecify.annotations.Nullable;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Spliterator;
 import java.util.concurrent.Callable;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 /**
  * The implementation of {@link PropagatedContext}.
@@ -42,6 +45,9 @@ import java.util.stream.Stream;
 final class PropagatedContextImpl implements PropagatedContext {
 
     static final PropagatedContextImpl EMPTY = new PropagatedContextImpl(new PropagatedContextElement[0], false, false);
+
+    static final Scope NOOP_SCOPE = () -> {
+    };
 
     final PropagatedContextElement[] elements;
     final boolean containsThreadElements;
@@ -66,7 +72,7 @@ final class PropagatedContextImpl implements PropagatedContext {
     public <V> V propagate(Supplier<V> supplier) {
         return switch (PropagatedContextConfiguration.get()) {
             case SCOPED_VALUE -> {
-                if (ScopedValues.get() == this) {
+                if (isScopedValueBound()) {
                     yield supplier.get();
                 } else {
                     Supplier<V> originalSupplier = supplier;
@@ -85,7 +91,12 @@ final class PropagatedContextImpl implements PropagatedContext {
                             }
                         };
                     }
-                    yield ScopedValues.propagate(this, delegate);
+                    PropagatedContext threadBound = ThreadBoundPropagation.suspend();
+                    try {
+                        yield ScopedValues.propagate(this, delegate);
+                    } finally {
+                        ThreadBoundPropagation.resume(threadBound);
+                    }
                 }
             }
             case THREAD_LOCAL -> ThreadContext.propagate(this, supplier);
@@ -96,7 +107,7 @@ final class PropagatedContextImpl implements PropagatedContext {
     public <V> V propagateCall(Callable<V> callable) throws Exception {
         return switch (PropagatedContextConfiguration.get()) {
             case SCOPED_VALUE -> {
-                if (ScopedValues.get() == this) {
+                if (isScopedValueBound()) {
                     yield callable.call();
                 } else {
                     Callable<V> originalCallable = callable;
@@ -115,7 +126,12 @@ final class PropagatedContextImpl implements PropagatedContext {
                             }
                         };
                     }
-                    yield ScopedValues.propagate(this, delegate);
+                    PropagatedContext threadBound = ThreadBoundPropagation.suspend();
+                    try {
+                        yield ScopedValues.propagate(this, delegate);
+                    } finally {
+                        ThreadBoundPropagation.resume(threadBound);
+                    }
                 }
             }
             case THREAD_LOCAL -> ThreadContext.propagate(this, callable);
@@ -127,7 +143,7 @@ final class PropagatedContextImpl implements PropagatedContext {
         PropagatedContextConfiguration.Mode mode = PropagatedContextConfiguration.get();
         switch (mode) {
             case SCOPED_VALUE -> {
-                if (ScopedValues.get() == this) {
+                if (isScopedValueBound()) {
                     runnable.run();
                 } else {
                     Runnable originalRunnable = runnable;
@@ -146,12 +162,33 @@ final class PropagatedContextImpl implements PropagatedContext {
                             }
                         };
                     }
-                    ScopedValues.propagate(this, delegate);
+                    PropagatedContext threadBound = ThreadBoundPropagation.suspend();
+                    try {
+                        ScopedValues.propagate(this, delegate);
+                    } finally {
+                        ThreadBoundPropagation.resume(threadBound);
+                    }
                 }
             }
             case THREAD_LOCAL -> ThreadContext.propagate(this, runnable);
             default -> throw new IllegalStateException("Unsupported propagation mode: " + mode);
         }
+    }
+
+    /**
+     * Whether this context is already in scope with scoped-value propagation, so that a callback can run directly.
+     * A context only {@link ThreadBoundPropagation bound to the thread} is not, it must still be bound to the scoped
+     * value so that its scoped value elements are bound and the code it runs, such as subtasks forked by a
+     * {@link java.util.concurrent.StructuredTaskScope}, inherits it.
+     *
+     * @return true if this context is in scope
+     */
+    private boolean isScopedValueBound() {
+        if (ScopedValues.get() != this) {
+            return false;
+        }
+        PropagatedContext threadBound = ThreadBoundPropagation.get();
+        return threadBound == null || threadBound == this;
     }
 
     @Override
@@ -214,7 +251,10 @@ final class PropagatedContextImpl implements PropagatedContext {
     @Nullable
     public static PropagatedContext getOrNull() {
         return switch (PropagatedContextConfiguration.get()) {
-            case SCOPED_VALUE -> ScopedValues.get();
+            case SCOPED_VALUE -> {
+                PropagatedContext threadBound = ThreadBoundPropagation.get();
+                yield threadBound != null ? threadBound : ScopedValues.get();
+            }
             case THREAD_LOCAL -> ThreadContext.get();
         };
     }
@@ -240,8 +280,10 @@ final class PropagatedContextImpl implements PropagatedContext {
     public Scope propagate() {
         return switch (PropagatedContextConfiguration.get()) {
             case THREAD_LOCAL -> ThreadContext.propagate(ThreadContext.get(), this);
+            // A ScopedValue is only bound for the extent of Carrier.run/call, it cannot be bound now and unbound by a later call
             case SCOPED_VALUE ->
-                throw new IllegalStateException("Scope propagation requires thread-local support. Set 'micronaut.propagation' to 'thread-local'.");
+                throw new IllegalStateException("PropagatedContext.propagate() without a callback requires thread-local propagation. "
+                    + "Use a callback such as propagate(Supplier), or propagateIfSupported(), or set 'micronaut.propagation' to 'thread-local'.");
         };
     }
 
@@ -298,12 +340,26 @@ final class PropagatedContextImpl implements PropagatedContext {
     }
 
     @Override
+    public <T extends PropagatedContextElement> @Nullable T findOrNull(Class<T> elementType, Predicate<? super T> filter) {
+        for (int i = elements.length - 1; i >= 0; i--) {
+            PropagatedContextElement element = elements[i];
+            if (elementType.isInstance(element)) {
+                T typed = elementType.cast(element);
+                if (filter.test(typed)) {
+                    return typed;
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
     public <T extends PropagatedContextElement> Stream<T> findAll(Class<T> elementType) {
-        List<PropagatedContextElement> reverseElements = new ArrayList<>(Arrays.asList(elements));
-        Collections.reverse(reverseElements);
-        return reverseElements.stream()
-            .filter(elementType::isInstance)
-            .map(elementType::cast);
+        if (elements.length == 0) {
+            return Stream.empty();
+        }
+        // The elements array is never mutated, so it can be traversed in place
+        return StreamSupport.stream(new ReverseElementSpliterator<>(elements, elementType), false);
     }
 
     @Override
@@ -328,7 +384,7 @@ final class PropagatedContextImpl implements PropagatedContext {
 
     @Override
     public List<PropagatedContextElement> getAllElements() {
-        return new ArrayList<>(Arrays.asList(elements));
+        return Collections.unmodifiableList(Arrays.asList(elements));
     }
 
     static ThreadState[] updateThreadState(PropagatedContextImpl propagatedContext) {
@@ -358,6 +414,62 @@ final class PropagatedContextImpl implements PropagatedContext {
             element.restoreThreadContext(state);
         }
 
+    }
+
+    /**
+     * Traverses the elements of the given type from the last added to the first one without copying the array.
+     *
+     * @param <T> The element type
+     */
+    private static final class ReverseElementSpliterator<T extends PropagatedContextElement> implements Spliterator<T> {
+
+        private final PropagatedContextElement[] elements;
+        private final Class<T> elementType;
+        private int index;
+
+        ReverseElementSpliterator(PropagatedContextElement[] elements, Class<T> elementType) {
+            this.elements = elements;
+            this.elementType = elementType;
+            this.index = elements.length - 1;
+        }
+
+        @Override
+        public boolean tryAdvance(Consumer<? super T> action) {
+            while (index >= 0) {
+                PropagatedContextElement element = elements[index--];
+                if (elementType.isInstance(element)) {
+                    action.accept(elementType.cast(element));
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void forEachRemaining(Consumer<? super T> action) {
+            for (int i = index; i >= 0; i--) {
+                PropagatedContextElement element = elements[i];
+                if (elementType.isInstance(element)) {
+                    action.accept(elementType.cast(element));
+                }
+            }
+            index = -1;
+        }
+
+        @Override
+        public @Nullable Spliterator<T> trySplit() {
+            return null;
+        }
+
+        @Override
+        public long estimateSize() {
+            return (long) index + 1;
+        }
+
+        @Override
+        public int characteristics() {
+            return ORDERED | NONNULL | IMMUTABLE;
+        }
     }
 
 }

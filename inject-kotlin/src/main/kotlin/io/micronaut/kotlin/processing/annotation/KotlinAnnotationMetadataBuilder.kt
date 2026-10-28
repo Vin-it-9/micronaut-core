@@ -39,6 +39,7 @@ import com.google.devtools.ksp.symbol.Location
 import com.google.devtools.ksp.symbol.Origin
 import io.micronaut.context.annotation.Property
 import io.micronaut.core.annotation.AnnotationClassValue
+import io.micronaut.core.annotation.AnnotationMetadata
 import io.micronaut.core.annotation.AnnotationUtil
 import io.micronaut.core.annotation.AnnotationValue
 import io.micronaut.core.reflect.ClassUtils
@@ -47,6 +48,8 @@ import io.micronaut.core.util.StringUtils
 import io.micronaut.inject.annotation.AbstractAnnotationMetadataBuilder
 import io.micronaut.inject.annotation.MutableAnnotationMetadata
 import io.micronaut.inject.visitor.VisitorContext
+import io.micronaut.kotlin.processing.visitor.KotlinClassNativeElement
+import io.micronaut.kotlin.processing.visitor.KotlinPropertyGetterNativeElement
 import io.micronaut.kotlin.processing.visitor.KotlinVisitorContext
 import java.lang.annotation.Repeatable
 import java.lang.annotation.RetentionPolicy
@@ -224,7 +227,7 @@ internal class KotlinAnnotationMetadataBuilder(
         ksType: KSType,
         annotationMetadata: MutableAnnotationMetadata
     ) {
-        if (ksType.isMarkedNullable) {
+        if (visitorContext.expandTypeAlias(ksType).isMarkedNullable) {
             // explicitly allowed to be null so add nullable
             annotationMetadata.addDeclaredAnnotation(AnnotationUtil.NULLABLE, emptyMap())
         } else {
@@ -338,10 +341,10 @@ internal class KotlinAnnotationMetadataBuilder(
         val property = member as KSPropertyDeclaration
         return when (annotationValue) {
             is Collection<*> -> {
-                toArray(annotationValue, member, property.type)
+                arrayOrExpression(originatingElement, annotationName, memberName, toArray(annotationValue, member, property.type))
             }
             is Array<*> -> {
-                toArray(annotationValue.toList(), member, property.type)
+                arrayOrExpression(originatingElement, annotationName, memberName, toArray(annotationValue.toList(), member, property.type))
             }
             else -> {
                 if (isEvaluatedExpression(annotationValue)) {
@@ -358,6 +361,17 @@ internal class KotlinAnnotationMetadataBuilder(
         }
     }
 
+    private fun arrayOrExpression(
+        originatingElement: KSAnnotated,
+        annotationName: String,
+        memberName: String,
+        array: Array<out Any>
+    ): Any = if (isEvaluatedExpression(array)) {
+        buildEvaluatedExpressionReference(originatingElement, annotationName, memberName, array)
+    } else {
+        array
+    }
+
     private fun toArray(
         annotationValue: Collection<*>,
         element: KSAnnotated,
@@ -367,11 +381,7 @@ internal class KotlinAnnotationMetadataBuilder(
         if (annotationValue.isEmpty()) {
             val arrayType = type.resolve()
             if (arrayType.declaration.qualifiedName?.asString() == "kotlin.Array") {
-                val className = visitorContext.getBinaryName(arrayType.arguments[0].type!!.resolve().declaration)
-                val optionalClassName = findJavaClass(className)
-                if (optionalClassName.isPresent) {
-                    valueType = optionalClassName.get() as Class<Any>
-                }
+                valueType = emptyArrayComponentType(arrayType.arguments[0].type!!.resolve().declaration)
             }
         }
         val collection = annotationValue.filterNotNull().map {
@@ -380,6 +390,33 @@ internal class KotlinAnnotationMetadataBuilder(
             v
         } // annotation values can't be null
         return ArrayUtils.toArray(collection, valueType)
+    }
+
+    /**
+     * Resolves the component type of an array member that is given no element. It is the type the value of an element
+     * has, so that the member holds the same type whether or not it is given one, which is what javac does. Only the
+     * elements of a `kotlin.Array` are resolved here: the elements of a primitive array are held as objects.
+     *
+     * @param elementDeclaration The declaration of the element type the member declares
+     * @return The component type the empty array is created with
+     */
+    private fun emptyArrayComponentType(elementDeclaration: KSDeclaration): Class<Any> {
+        if (elementDeclaration is KSTypeAlias) {
+            // the value of an element is read through the alias, so the empty array is typed through it too
+            return emptyArrayComponentType(elementDeclaration.type.resolve().declaration)
+        }
+        val elementName = elementDeclaration.qualifiedName?.asString()
+        val classKind = (elementDeclaration as? KSClassDeclaration)?.classKind
+        val componentType = when {
+            // a class is read as a class value, and KSP presents a Java Class<?> member as an Array<KClass<*>>
+            elementName == "kotlin.reflect.KClass" || elementName == "java.lang.Class" ->
+                AnnotationClassValue::class.java
+            classKind == ClassKind.ANNOTATION_CLASS -> AnnotationValue::class.java
+            // an enum constant is read as its name
+            classKind == ClassKind.ENUM_CLASS -> String::class.java
+            else -> findJavaClass(visitorContext.getBinaryName(elementDeclaration)).orElse(Any::class.java)
+        }
+        return componentType as Class<Any>
     }
 
     override fun readAnnotationDefaultValues(
@@ -552,6 +589,17 @@ internal class KotlinAnnotationMetadataBuilder(
             .or { ClassUtils.forName(className, javaClass.classLoader) }
             .or { ClassUtils.forName(className, visitorContext::class.java.classLoader) }
 
+    override fun getTypeCacheKey(typeElement: KSAnnotated): Any {
+        // The metadata of a class is cached under the key of its class element, see
+        // KotlinElementAnnotationMetadataFactory.getClassDefinitionCacheKey; an annotation type resolved from an
+        // occurrence or by name must find the metadata a visitor mutated through that element
+        val declaration = if (typeElement is KotlinAnnotationType) typeElement.type else typeElement
+        if (declaration is KSClassDeclaration) {
+            return KotlinClassNativeElement(declaration, null)
+        }
+        return typeElement
+    }
+
     override fun getAnnotationMirror(annotationName: String): Optional<KSAnnotated> {
         // annotation names are binary names (Outer$Inner), while KSP looks a declaration up by source name (Outer.Inner)
         val declaration = visitorContext.classDeclarationByName(annotationName)
@@ -561,6 +609,32 @@ internal class KotlinAnnotationMetadataBuilder(
                 null
             }
         return Optional.ofNullable(declaration)
+    }
+
+    /*
+     * KSP answers the members of an annotation class as its properties, and the member element a visitor reads
+     * and mutates is a property element, which writes its annotations to the property's getter: the metadata is
+     * looked up under the getter's key, the one KotlinElementAnnotationMetadataFactory.lookupForMethod uses for it.
+     */
+    override fun getAnnotationMemberMetadata(
+        annotationName: String,
+        annotationType: KSAnnotated,
+        member: KSAnnotated
+    ): AnnotationMetadata {
+        val declaration = if (annotationType is KotlinAnnotationType) annotationType.type else annotationType
+        if (declaration is KSClassDeclaration && member is KSPropertyDeclaration) {
+            val getter = member.getter
+            if (getter != null) {
+                return lookupOrBuild(
+                    KotlinElementAnnotationMetadataFactory.Key2(
+                        KotlinClassNativeElement(declaration),
+                        KotlinPropertyGetterNativeElement(getter)
+                    ),
+                    getter
+                ).annotationMetadata
+            }
+        }
+        return super.getAnnotationMemberMetadata(annotationName, annotationType, member)
     }
 
     override fun getAnnotationMember(annotationElement: KSAnnotated, member: CharSequence): KSAnnotated? {

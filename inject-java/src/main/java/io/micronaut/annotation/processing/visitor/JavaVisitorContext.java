@@ -32,6 +32,7 @@ import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.StringUtils;
 import io.micronaut.expressions.context.DefaultExpressionCompilationContextFactory;
 import io.micronaut.expressions.context.ExpressionCompilationContextFactory;
+import io.micronaut.inject.annotation.AnnotationBuilderRegistrations;
 import io.micronaut.inject.ast.ClassElement;
 import io.micronaut.inject.ast.annotation.AbstractAnnotationElement;
 import io.micronaut.inject.ast.annotation.ElementAnnotationMetadataFactory;
@@ -340,6 +341,13 @@ public final class JavaVisitorContext implements VisitorContext, BeanElementVisi
     @Override
     public ExpressionCompilationContextFactory getExpressionCompilationContextFactory() {
         return expressionCompilationContextFactory;
+    }
+
+    @Override
+    public AnnotationBuilderRegistrations getAnnotationBuilderRegistrations() {
+        // the element utilities of javac are shared by the processors of a compilation, the processing environment
+        // and the filer can be wrapped per processor
+        return AnnotationBuilderRegistrations.forCompilation(elements);
     }
 
     @Override
@@ -654,6 +662,19 @@ public final class JavaVisitorContext implements VisitorContext, BeanElementVisi
     @Internal
     void addBeanDefinitionBuilder(JavaBeanDefinitionBuilder javaBeanDefinitionBuilder) {
         this.beanDefinitionBuilders.add(javaBeanDefinitionBuilder);
+    }
+
+    @Override
+    public BeanElementBuilder registerBean(ClassElement beanType, io.micronaut.inject.ast.Element... originatingElements) {
+        AbstractBeanDefinitionBuilder.requireOriginatingElements(beanType, originatingElements);
+        JavaBeanDefinitionBuilder builder = new JavaBeanDefinitionBuilder(
+            originatingElements[0],
+            beanType,
+            beanType instanceof AbstractAnnotationElement aae ? aae.getElementAnnotationMetadataFactory() : elementAnnotationMetadataFactory,
+            this
+        );
+        builder.addOriginatingElements(originatingElements);
+        return builder;
     }
 
     @Override

@@ -16,6 +16,7 @@
 package io.micronaut.context.python;
 
 import io.micronaut.core.annotation.Internal;
+import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 import org.jspecify.annotations.Nullable;
@@ -25,6 +26,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
 /**
@@ -51,6 +54,41 @@ final class GraalPyExceptionHandler {
                 throw error;
             }
         }
+    }
+
+    /**
+     * The failure of a Java stage as it may be handed to Python code of a context.
+     * <p>
+     * A Python exception raised in another context (a coroutine of a singleton awaited from an
+     * event-loop context) cannot be handed over as it is: Python code reading its {@code __cause__}
+     * fails with an internal GraalPy error that no {@code except} clause catches. It is replaced by a
+     * Java exception with its message and stack trace; its Python type does not exist in the
+     * receiving context anyway, as a synchronous call between contexts shows.
+     *
+     * @param context The context the failure is handed to
+     * @param failure The failure
+     * @return The failure, or its replacement
+     */
+    static @Nullable Throwable forContext(Context context, @Nullable Throwable failure) {
+        Throwable unwrapped = failure;
+        while ((unwrapped instanceof CompletionException || unwrapped instanceof ExecutionException) && unwrapped.getCause() != null) {
+            unwrapped = unwrapped.getCause();
+        }
+        if (!(unwrapped instanceof PolyglotException polyglotException) || !polyglotException.isGuestException()) {
+            return failure;
+        }
+        Value guestObject;
+        try {
+            guestObject = polyglotException.getGuestObject();
+        } catch (IllegalStateException | UnsupportedOperationException e) {
+            return failure;
+        }
+        if (guestObject == null || context.equals(guestObject.getContext())) {
+            return failure;
+        }
+        RuntimeException replacement = new RuntimeException(polyglotException.getMessage());
+        replacement.setStackTrace(polyglotException.getStackTrace());
+        return replacement;
     }
 
     /**
@@ -82,9 +120,53 @@ final class GraalPyExceptionHandler {
                 }
                 RuntimeException generated = toGeneratedRuntimeException(polyglotException);
                 return generated != null ? generated : polyglotException;
+            } catch (RuntimeException generatedException) {
+                // The context's exception handler may already have mapped the guest exception.
+                if (generatedException instanceof ValueCoercible) {
+                    return generatedException;
+                }
+                throw generatedException;
             }
         }
         return new RuntimeException(exception.toString());
+    }
+
+    /**
+     * The Java exception of a Python exception a compiled body raises, as {@link #rethrowHostRuntimeException}
+     * maps one raised in Python: the Java object the Python exception is already bound to, else its
+     * generated class created through the {@code Value} constructor. The generated class is the one
+     * the compiled body names, which its compiled handlers catch: when it cannot be created, no other
+     * exception is thrown in its place, which those handlers would let through silently, but an
+     * {@link IllegalStateException} naming the class and why.
+     *
+     * @param generatedClass The generated class of the exception class
+     * @param exception      The Python exception
+     * @return The Java exception
+     * @throws IllegalStateException When the generated class cannot be created for the Python exception
+     */
+    static RuntimeException raised(Class<?> generatedClass, Value exception) {
+        RuntimeException generated = mappedException(exception, RuntimeException.class);
+        if (generated != null) {
+            return generated;
+        }
+        String why;
+        if (!RuntimeException.class.isAssignableFrom(generatedClass)) {
+            why = "it does not extend RuntimeException";
+        } else if (!ValueCoercible.class.isAssignableFrom(generatedClass)) {
+            why = "it does not implement ValueCoercible";
+        } else {
+            try {
+                return (RuntimeException) generatedClass.getConstructor(Value.class).newInstance(exception);
+            } catch (InvocationTargetException e) {
+                throw constructorFailed(generatedClass.getName(), exception, e);
+            } catch (NoSuchMethodException e) {
+                why = "it has no public constructor taking the Value of the Python exception";
+            } catch (ReflectiveOperationException | LinkageError e) {
+                why = e.toString();
+            }
+        }
+        throw new IllegalStateException("Cannot create the Java exception [" + generatedClass.getName() + "] a compiled body raises for the Python exception ["
+            + exception + "]: " + why + ". The compiled handlers of the exception class catch no other exception.");
     }
 
     private static @Nullable RuntimeException toGeneratedRuntimeException(PolyglotException exception) {
@@ -194,13 +276,19 @@ final class GraalPyExceptionHandler {
             Constructor<?> constructor = exceptionClass.getConstructor(Value.class);
             return exceptionType.cast(constructor.newInstance(guestObject));
         } catch (InvocationTargetException e) {
-            // the generated constructor failed to call the Java super constructor: a programming
-            // error of the Python class, not a Python exception to report as is
-            throw new IllegalStateException("Cannot create the Java exception [" + className + "] for the Python exception ["
-                + guestObject + "]: " + e.getCause(), e.getCause());
+            throw constructorFailed(className, guestObject, e);
         } catch (ReflectiveOperationException | LinkageError e) {
             return null;
         }
+    }
+
+    /**
+     * The generated constructor failed to call the Java super constructor: a programming error of
+     * the Python class, not a Python exception to report as is.
+     */
+    private static IllegalStateException constructorFailed(String className, Value guestObject, InvocationTargetException e) {
+        return new IllegalStateException("Cannot create the Java exception [" + className + "] for the Python exception ["
+            + guestObject + "]: " + e.getCause(), e.getCause());
     }
 
     private static void addCandidate(Set<String> candidates, @Nullable String candidate) {

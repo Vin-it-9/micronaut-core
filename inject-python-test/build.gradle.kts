@@ -20,6 +20,7 @@ dependencies {
     api(libs.jakarta.inject.api)
 
     testImplementation(libs.junit.jupiter)
+    testImplementation(libs.h2)
     testImplementation(libs.junit.platform.launcher)
     testImplementation(libs.micronaut.test.junit5)
     testImplementation(platform(libs.test.boms.micronaut.validation))
@@ -27,7 +28,13 @@ dependencies {
     testImplementation(platform(libs.test.boms.micronaut.sql))
     testImplementation(platform(libs.test.boms.micronaut.serde))
     testImplementation(libs.managed.reactor)
+    testImplementation("io.micronaut.email:micronaut-email:3.2.0")
+    // @Cacheable advice on Python beans, keyed by a subset of the parameters
+    testImplementation("io.micronaut.cache:micronaut-cache-caffeine:6.1.1") {
+        exclude(group = "io.micronaut")
+    }
     testImplementation(projects.micronautInjectJavaHelper)
+    testImplementation(projects.micronautInjectTestUtils)
     testImplementation(projects.micronautRetry)
     testImplementation(projects.micronautMessaging)
     testImplementation(libs.micronaut.validation)
@@ -60,4 +67,11 @@ tasks {
     sourcesJar {
         from("$projectDir/src/main/groovy")
     }
+}
+
+// Run the whole corpus of tests at a type-check mode: ./gradlew :micronaut-inject-python-test:test -Ppython-ci -Dmicronaut.python.typecheck=error
+// or at a static compilation mode: -Dmicronaut.python.compile.static=all
+tasks.withType<Test>().configureEach {
+    System.getProperty("micronaut.python.typecheck")?.let { systemProperty("micronaut.python.typecheck", it) }
+    System.getProperty("micronaut.python.compile.static")?.let { systemProperty("micronaut.python.compile.static", it) }
 }

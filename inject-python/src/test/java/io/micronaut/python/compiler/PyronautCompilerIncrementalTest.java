@@ -17,6 +17,7 @@ package io.micronaut.python.compiler;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import io.micronaut.python.processing.PythonAstParser;
 import io.micronaut.python.processing.PythonProcessingSession;
 
 import javax.annotation.processing.AbstractProcessor;
@@ -25,6 +26,10 @@ import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.TypeElement;
 import java.io.IOException;
+import java.io.File;
+import java.util.jar.JarOutputStream;
+import java.util.zip.ZipEntry;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -141,6 +146,49 @@ final class PyronautCompilerIncrementalTest {
                 "META-INF/GRAALPY-VFS/micronaut-application/src/example.py"
             )).contains("value: int = 2"));
         }
+    }
+
+    @Test
+    void keepsTheWarmContextAcrossCompilationsOfAnUnchangedClasspath(@TempDir Path directory) throws Exception {
+        Path python = Files.createDirectories(directory.resolve("python"));
+        Path java = Files.createDirectories(directory.resolve("java"));
+        Path output = Files.createDirectories(directory.resolve("classes"));
+        Path classes = Files.createDirectories(directory.resolve("sibling-classes"));
+        Files.writeString(classes.resolve("Marker.txt"), "unchanged");
+        Path jar = directory.resolve("library.jar");
+        writeJar(jar, "unchanged");
+        Path source = Files.writeString(python.resolve("example.py"), "class Example:\n    value: int = 1\n");
+
+        try (PythonProcessingSession session = new PythonProcessingSession()) {
+            compilePython(python, java, output, List.of(classes.toFile(), jar.toFile()), session);
+            PythonAstParser first = session.parser(getClass().getClassLoader(), false);
+
+            // a compiler daemon compiles the same project again: the sources changed, the class path did not,
+            // and the GraalPy context, the costly half of a cold compilation, is kept
+            Files.writeString(source, "class Example:\n    value: int = 2\n");
+            compilePython(python, java, output, List.of(classes.toFile(), jar.toFile()), session);
+            assertSame(first, session.parser(getClass().getClassLoader(), false));
+            assertTrue(Files.readString(output.resolve("META-INF/GRAALPY-VFS/micronaut-application/src/example.py")).contains("value: int = 2"));
+        }
+    }
+
+    private static void writeJar(Path jar, String content) throws IOException {
+        try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new ZipEntry("marker.txt"));
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+            out.closeEntry();
+        }
+    }
+
+    private static void compilePython(Path python, Path java, Path output, List<File> classpath, PythonProcessingSession session) {
+        PyronautCompiler.builder()
+            .pythonSrc(python.toString())
+            .javaSrc(java.toString())
+            .targetDir(output.toFile())
+            .classpath(classpath)
+            .pythonProcessingSession(session)
+            .build()
+            .compile();
     }
 
     @Test
@@ -421,6 +469,89 @@ final class PyronautCompilerIncrementalTest {
 
         assertFalse(Files.exists(output.resolve("Alpha.class")));
         assertTrue(Files.isRegularFile(output.resolve("Beta.class")));
+    }
+
+    @Test
+    void functionalInterfaceProviderKeepsPythonCompilationIncremental(@TempDir Path directory) throws Exception {
+        Path python = Files.createDirectories(directory.resolve("python"));
+        Path java = Files.createDirectories(directory.resolve("java"));
+        Path output = directory.resolve("classes");
+        Path cache = directory.resolve("incremental");
+        Path alpha = python.resolve("alpha.py");
+        Files.writeString(alpha, """
+            from java.util.function import Function
+            from jakarta.inject import Singleton
+            @Singleton
+            class Alpha:
+                def apply(self, fn: Function) -> int:
+                    return 1
+            """);
+        Files.writeString(python.resolve("beta.py"), """
+            from jakarta.inject import Singleton
+            @Singleton
+            class Beta:
+                value: int = 2
+            """);
+
+        compilePython(python, java, output, cache);
+        Set<String> providerOutputs = functionalInterfaceProviderOutputs(output);
+        assertTrue(providerOutputs.stream().anyMatch(path -> path.endsWith("$Definition.class")));
+        assertTrue(providerOutputs.stream().anyMatch(path -> path.startsWith(
+            "META-INF/micronaut/io.micronaut.inject.BeanDefinitionReference/"
+        )));
+        Properties state = state(cache);
+        assertEquals("true", state.getProperty("processor.compatible"));
+        assertTrue(decodeStateList(state.getProperty("python.aggregating.outputs")).containsAll(providerOutputs));
+        assertTrue(decodeStateList(state.getProperty("shared.outputs")).stream()
+            .noneMatch(path -> path.contains("$PythonFunctionalInterfaces$")));
+
+        Path betaBean = findOutput(output, "Beta$Definition.class");
+        Files.setLastModifiedTime(betaBean, UNCHANGED_MARKER);
+        Files.writeString(alpha, Files.readString(alpha).replace("return 1", "return 2"));
+        compilePython(python, java, output, cache);
+
+        assertEquals(UNCHANGED_MARKER, Files.getLastModifiedTime(betaBean));
+        assertEquals(providerOutputs, functionalInterfaceProviderOutputs(output));
+        assertEquals("true", state(cache).getProperty("processor.compatible"));
+    }
+
+    @Test
+    void replacesTheFunctionalInterfaceProviderWhenItsInterfacesChange(@TempDir Path directory) throws Exception {
+        Path python = Files.createDirectories(directory.resolve("python"));
+        Path java = Files.createDirectories(directory.resolve("java"));
+        Path output = directory.resolve("classes");
+        Path cache = directory.resolve("incremental");
+        Path alpha = python.resolve("alpha.py");
+        Files.writeString(alpha, """
+            from java.util.function import Function
+            from jakarta.inject import Singleton
+            @Singleton
+            class Alpha:
+                def apply(self, fn: Function) -> int:
+                    return 1
+            """);
+
+        compilePython(python, java, output, cache);
+        Set<String> previousOutputs = functionalInterfaceProviderOutputs(output);
+        assertFalse(previousOutputs.isEmpty());
+
+        Files.writeString(alpha, """
+            from java.util.function import Supplier
+            from jakarta.inject import Singleton
+            @Singleton
+            class Alpha:
+                def apply(self, fn: Supplier) -> int:
+                    return 1
+            """);
+        compilePython(python, java, output, cache);
+
+        Set<String> currentOutputs = functionalInterfaceProviderOutputs(output);
+        assertFalse(currentOutputs.isEmpty());
+        assertTrue(currentOutputs.stream().noneMatch(previousOutputs::contains));
+        assertEquals(1, currentOutputs.stream().filter(path -> path.endsWith(".java")).count());
+        Properties state = state(cache);
+        assertEquals("true", state.getProperty("processor.compatible"));
+        assertTrue(decodeStateList(state.getProperty("python.aggregating.outputs")).containsAll(currentOutputs));
     }
 
     @Test
@@ -1919,6 +2050,15 @@ final class PyronautCompilerIncrementalTest {
                 .filter(path -> path.getFileName().toString().endsWith(suffix))
                 .findFirst()
                 .orElseThrow();
+        }
+    }
+
+    private static Set<String> functionalInterfaceProviderOutputs(Path output) throws Exception {
+        try (var paths = Files.walk(output)) {
+            return paths.filter(Files::isRegularFile)
+                .filter(path -> path.getFileName().toString().contains("$PythonFunctionalInterfaces$"))
+                .map(path -> output.relativize(path).toString().replace('\\', '/'))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
         }
     }
 

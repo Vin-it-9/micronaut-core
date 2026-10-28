@@ -23,6 +23,7 @@ import io.micronaut.http.MediaType;
 import io.micronaut.http.MutableHttpHeaders;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -45,6 +46,14 @@ public final class HttpHeadersUtil {
     private static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
     private static final String PROXY_HEADER_PREFIX = "proxy-";
     private static final String TE_TRAILERS = "trailers";
+    private static final List<String> FORWARDING_HEADERS = List.of(
+        HttpHeaders.FORWARDED,
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Host",
+        "X-Forwarded-Port",
+        "X-Forwarded-Prefix"
+    );
     private static final Supplier<Pattern> HEADER_MASK_PATTERNS = SupplierUtil.memoized(() ->
         Pattern.compile(".*(password|cred|cert|key|secret|token|auth|signat).*", Pattern.CASE_INSENSITIVE)
     );
@@ -57,7 +66,9 @@ public final class HttpHeadersUtil {
      * Remove the hop-by-hop headers, as a proxy must before it relays a request or a response
      * (RFC 9110, section 7.6.1): {@code Connection} and the headers it lists, {@code Keep-Alive},
      * {@code Proxy-*}, {@code TE}, {@code Trailer}, {@code Transfer-Encoding} and
-     * {@code Upgrade}. {@code TE: trailers} is kept when {@code TE} lists it: the trailers of a
+     * {@code Upgrade}. The forwarding headers ({@code Forwarded} and {@code X-Forwarded-*}) are
+     * kept even when {@code Connection} lists them: a proxy writes them for the next hop itself.
+     * {@code TE: trailers} is kept when {@code TE} lists it: the trailers of a
      * message travel with its body, so the next hop may send them.
      *
      * @param headers The headers to change
@@ -73,7 +84,7 @@ public final class HttpHeadersUtil {
                 int comma = connection.indexOf(',', start);
                 int end = comma < 0 ? length : comma;
                 String name = connection.substring(start, end).trim();
-                if (!name.isEmpty()) {
+                if (!name.isEmpty() && !isForwardingHeader(name)) {
                     headers.remove(name);
                 }
                 start = end + 1;
@@ -104,6 +115,15 @@ public final class HttpHeadersUtil {
         }
     }
 
+    private static boolean isForwardingHeader(String name) {
+        for (String forwarding : FORWARDING_HEADERS) {
+            if (forwarding.equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * @return Whether a {@code TE} header lists {@code trailers}, e.g.
      * {@code TE: gzip, trailers}, with or without a weight
@@ -132,6 +152,17 @@ public final class HttpHeadersUtil {
             }
         }
         return false;
+    }
+
+    /**
+     * Trace HTTP headers using the named logger and the standard masking policy.
+     *
+     * @param loggerName Logger name
+     * @param httpHeaders HTTP headers
+     * @since 5.2.14
+     */
+    public static void trace(String loggerName, HttpHeaders httpHeaders) {
+        trace(LoggerFactory.getLogger(loggerName), httpHeaders);
     }
 
     /**

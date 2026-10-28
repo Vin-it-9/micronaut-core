@@ -18,6 +18,7 @@ package io.micronaut.http.client.netty;
 import io.micronaut.context.BeanProvider;
 import io.micronaut.context.exceptions.NoSuchBeanException;
 import io.micronaut.core.annotation.Internal;
+import io.micronaut.core.execution.DelayedExecutionFlow;
 import io.micronaut.core.execution.ExecutionFlow;
 import io.micronaut.core.io.ResourceResolver;
 import io.micronaut.core.naming.NameUtils;
@@ -124,8 +125,6 @@ import io.netty.util.concurrent.GenericFutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
-import reactor.core.publisher.Mono;
-import reactor.core.publisher.Sinks;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
@@ -310,6 +309,13 @@ public class ConnectionManager {
     }
 
     /**
+     * @return The event loop group the connections of this manager run on
+     */
+    EventLoopGroup eventLoopGroup() {
+        return group;
+    }
+
+    /**
      * Allocator for this connection manager. Used by micronaut-oracle-cloud.
      *
      * @return The configured allocator
@@ -340,6 +346,26 @@ public class ConnectionManager {
             pool.pool.forEachConnection(c -> channels.add(((PoolHolder.ConnectionHolder) c).channel));
         }
         return channels;
+    }
+
+    /**
+     * For testing.
+     *
+     * @return Number of per-host connection pools currently registered
+     */
+    @SuppressWarnings("unused")
+    final int poolCount() {
+        return pools.size();
+    }
+
+    /**
+     * For testing.
+     *
+     * @return The live map of per-host connection pools
+     */
+    @SuppressWarnings("unused")
+    final Map<NettyHttpClient.RequestKey, PoolHolder> pools() {
+        return pools;
     }
 
     /**
@@ -532,7 +558,16 @@ public class ConnectionManager {
      * @return A mono that will complete once the channel is ready for transmission
      */
     public final ExecutionFlow<PoolHandle> connect(NettyHttpClient.RequestKey requestKey, @Nullable BlockHint blockHint, @Nullable AtomicReference<ScheduledExecutorService> preferredScheduler) {
-        return pools.computeIfAbsent(requestKey, rk -> createPool(rk, group)).acquire(blockHint, preferredScheduler);
+        while (true) {
+            PoolHolder holder = pools.computeIfAbsent(requestKey, rk -> createPool(rk, group));
+            ExecutionFlow<PoolHandle> flow = holder.acquire(blockHint, preferredScheduler);
+            if (flow != null) {
+                return flow;
+            }
+            // the pool retired concurrently because it became unused. Make sure it's gone from
+            // the map and try again with a fresh pool.
+            pools.remove(requestKey, holder);
+        }
     }
 
     /**
@@ -583,10 +618,11 @@ public class ConnectionManager {
      *
      * @param requestKey The remote to connect to
      * @param handler The websocket message handler
-     * @return A mono that will complete when the handshakes complete
+     * @return A flow that completes empty once the channel pipeline is set up. If the flow is
+     * cancelled before that, the channel is closed
      */
-    final Mono<?> connectForWebsocket(NettyHttpClient.RequestKey requestKey, ChannelHandler handler) {
-        Sinks.Empty<Object> initial = new CancellableMonoSink<>(null);
+    final ExecutionFlow<@Nullable Void> connectForWebsocket(NettyHttpClient.RequestKey requestKey, ChannelHandler handler) {
+        DelayedExecutionFlow<@Nullable Void> initial = DelayedExecutionFlow.create();
 
         ChannelFuture connectFuture = doConnect(requestKey, new CustomizerAwareInitializer() {
             @Override
@@ -597,14 +633,14 @@ public class ConnectionManager {
                     SslContext sslContext = buildWebsocketSslContext(requestKey);
                     if (sslContext != null) {
                         try {
-                            ch.pipeline().addLast(configureSslHandler(sslContext.newHandler(ch.alloc(), requestKey.getHost(), requestKey.getPort())));
+                            addSslHandler(ch.pipeline(), null, sslContext.newHandler(ch.alloc(), requestKey.getHost(), requestKey.getPort()));
                         } finally {
                             ReferenceCountUtil.release(sslContext);
                         }
                     }
                 } catch (Throwable e) {
                     // report the failure instead of letting the channel close with a generic error
-                    initial.tryEmitError(new WebSocketSessionException("Error opening WebSocket client session: " + describe(e), e));
+                    initial.tryCompleteExceptionally(new WebSocketSessionException("Error opening WebSocket client session: " + describe(e), e));
                     ch.close();
                     return;
                 }
@@ -631,11 +667,12 @@ public class ConnectionManager {
                     }
                     ch.pipeline().addLast(ChannelPipelineCustomizer.HANDLER_MICRONAUT_WEBSOCKET_CLIENT, handler);
                     Objects.requireNonNull(bootstrappedCustomizer).specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION).onInitialPipelineBuilt();
-                    if (initial.tryEmitEmpty().isSuccess()) {
+                    // a cancelled connect closes the channel instead of completing
+                    if (!initial.isCancelled() && initial.tryComplete(null)) {
                         return;
                     }
                 } catch (Throwable e) {
-                    initial.tryEmitError(new WebSocketSessionException("Error opening WebSocket client session: " + describe(e), e));
+                    initial.tryCompleteExceptionally(new WebSocketSessionException("Error opening WebSocket client session: " + describe(e), e));
                 }
                 // failed
                 ch.close();
@@ -643,11 +680,11 @@ public class ConnectionManager {
         }, group);
         withPropagation(connectFuture, future -> {
             if (!future.isSuccess()) {
-                initial.tryEmitError(future.cause());
+                initial.tryCompleteExceptionally(future.cause());
             }
         });
 
-        return initial.asMono();
+        return initial;
     }
 
     private void configureProxy(ChannelPipeline pipeline, boolean secure, String host, int port) {
@@ -732,10 +769,19 @@ public class ConnectionManager {
     private SslHandler configureSslHandler(SslHandler sslHandler) {
         sslHandler.setHandshakeTimeoutMillis(configuration.getSslConfiguration().getHandshakeTimeout().toMillis());
         SSLEngine engine = sslHandler.engine();
-        SSLParameters params = engine.getSSLParameters();
-        params.setEndpointIdentificationAlgorithm("HTTPS");
-        engine.setSSLParameters(params);
+        if (!(configuration.getSslConfiguration() instanceof AbstractClientSslConfiguration acsc) || acsc.isEndpointIdentification()) {
+            SSLParameters params = engine.getSSLParameters();
+            params.setEndpointIdentificationAlgorithm("HTTPS");
+            engine.setSSLParameters(params);
+        }
         return sslHandler;
+    }
+
+    private void addSslHandler(ChannelPipeline pipeline, @Nullable String name, SslHandler sslHandler) {
+        pipeline.addLast(name, configureSslHandler(sslHandler));
+        if (configuration.getSslConfiguration() instanceof AbstractClientSslConfiguration acsc && acsc.getHostnameVerifier() != null) {
+            pipeline.addLast(new HostnameVerifierHandler(acsc.getHostnameVerifier(), sslHandler.engine()));
+        }
     }
 
     /**
@@ -1015,7 +1061,7 @@ public class ConnectionManager {
             SslContext sslContext = this.sslContext.get();
             if (sslContext != null) {
                 try {
-                    ch.pipeline().addLast(ChannelPipelineCustomizer.HANDLER_SSL, configureSslHandler(sslContext.newHandler(ch.alloc(), host, port)));
+                    addSslHandler(ch.pipeline(), ChannelPipelineCustomizer.HANDLER_SSL, sslContext.newHandler(ch.alloc(), host, port));
                 } finally {
                     ReferenceCountUtil.release(sslContext);
                 }
@@ -1273,7 +1319,7 @@ public class ConnectionManager {
 
         private final ResourceLeakTracker<PoolHandle> tracker = LEAK_DETECTOR.get().track(this);
 
-        private PoolHandle(boolean http2, Channel channel, Http1ResponseHandler responseHandler) {
+        PoolHandle(boolean http2, Channel channel, Http1ResponseHandler responseHandler) {
             this.http2 = http2;
             this.channel = channel;
             this.responseHandler = responseHandler;
@@ -1358,8 +1404,21 @@ public class ConnectionManager {
             };
         }
 
+        /**
+         * Acquire a connection from this pool.
+         *
+         * @param blockHint          Optional information about what threads are blocked for this
+         *                           connection request
+         * @param preferredScheduler Reference to set to the preferred scheduler
+         * @return The flow that completes with the connection, or {@code null} if this pool has
+         * been retired and a new pool must be used instead
+         */
+        @Nullable
         ExecutionFlow<PoolHandle> acquire(@Nullable BlockHint blockHint, @Nullable AtomicReference<ScheduledExecutorService> preferredScheduler) {
             Pool.PendingRequest sink = pool.createPendingRequest(blockHint);
+            if (sink == null) {
+                return null;
+            }
             sink.dispatch();
             if (preferredScheduler != null) {
                 EventExecutor destPool = sink.likelyEventLoop();
@@ -1383,6 +1442,12 @@ public class ConnectionManager {
         @Override
         public Throwable wrapError(@Nullable Throwable error) {
             return NettyHttpClient.connectError(error);
+        }
+
+        @Override
+        public void onPoolRetired() {
+            // two-arg remove, so that a newer pool for the same key is not removed
+            pools.remove(requestKey, this);
         }
 
         @Override

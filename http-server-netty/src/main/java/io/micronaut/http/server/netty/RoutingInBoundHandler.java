@@ -43,6 +43,7 @@ import io.micronaut.http.netty.body.RawDuplexHandler;
 import io.micronaut.http.netty.channel.ChannelPipelineCustomizer;
 import io.micronaut.http.exceptions.HttpStatusException;
 import io.micronaut.http.server.RouteExecutor;
+import io.micronaut.http.server.binding.AsyncRequestBodyFactory;
 import io.micronaut.http.server.ServerResponseAttributes;
 import io.micronaut.http.server.binding.RequestArgumentSatisfier;
 import io.micronaut.http.server.netty.configuration.NettyHttpServerConfiguration;
@@ -136,6 +137,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
      * counting and event publication are skipped entirely — the feature adds zero cost.
      */
     private final boolean hasResponseWrittenListeners;
+    private final AsyncRequestBodyFactory asyncBodies;
     /**
      * Decides whether a {@link HttpRequestTerminatedEvent} has to be published for a request.
      * Resolved on first use, see {@link #resolveTerminatedEventFilter()}.
@@ -175,6 +177,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
         Optional<Boolean> isMultiPartEnabled = serverConfiguration.getMultipart().getEnabled();
         this.multipartEnabled = isMultiPartEnabled.isEmpty() || isMultiPartEnabled.get();
         this.routeExecutor = embeddedServerContext.getRouteExecutor();
+        this.asyncBodies = embeddedServerContext.getApplicationContext().getBean(AsyncRequestBodyFactory.class);
         this.conversionService = conversionService;
         this.applicationContext = embeddedServerContext.getApplicationContext();
     }
@@ -215,6 +218,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
 
     private void cleanupRequest(NettyHttpRequest<?> request) {
         try {
+            request.responseCleanedUp();
             request.release();
         } finally {
             ExecutionFlow<Void> terminatedFlow = ExecutionFlow.empty();
@@ -266,6 +270,10 @@ public final class RoutingInBoundHandler implements RequestHandler {
             }
         }
         responseWritten(attachment);
+    public void responseFailed(@Nullable Object attachment, Throwable cause) {
+        if (attachment != null) {
+            ((NettyHttpRequest<?>) attachment).responseFailed(cause);
+        }
     }
 
     @Override
@@ -363,12 +371,28 @@ public final class RoutingInBoundHandler implements RequestHandler {
             .propagate(() -> new NettyRequestLifecycle(this, outboundAccess).handleNormal(mnRequest));
     }
 
+    /**
+     * Give a request created outside this handler, e.g. a WebSocket upgrade, the
+     * {@link io.micronaut.http.body.AsyncRequestBody} of its filters, see
+     * {@link io.micronaut.http.body.AsyncRequestBody#of(io.micronaut.http.HttpRequest)}.
+     *
+     * @param request The request
+     * @since 5.3.0
+     */
+    @Internal
+    public void prepareAsyncRequestBody(NettyHttpRequest<?> request) {
+        request.setAsyncRequestBodySource(asyncBodies);
+    }
+
     private void prepareRequest(ChannelHandlerContext ctx, OutboundAccess outboundAccess, NettyHttpRequest<Object> mnRequest) {
+        // every request that runs the filters, the requests of early errors too
+        mnRequest.setAsyncRequestBodySource(asyncBodies);
         if (supportLoggingHandler && hasAccessLogHandler(ctx)) {
             // Micronaut Session needs this to extract values from the Micronaut Http Request for logging
             ctx.channel().attr(ACCESS_LOG_REQUEST_ATTRIBUTE).set(mnRequest);
         }
         outboundAccess.attachment(mnRequest);
+        mnRequest.outboundAccess(outboundAccess);
     }
 
     /**
@@ -473,6 +497,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
             finalResponse.onComplete((r, t) -> {
                 ByteBodyHttpResponse<?> encodedResponse;
                 if (t != null) {
+                    nettyHttpRequest.responseFailed(t);
                     // fallback of the fallback...
                     encodedResponse = ByteBodyHttpResponseWrapper.wrap(HttpResponse.serverError(), NettyByteBodyFactory.empty());
                     try {
@@ -487,8 +512,13 @@ public final class RoutingInBoundHandler implements RequestHandler {
                 UpgradedHttpResponse<?> upgraded = encodedResponse.code() == HttpResponseStatus.SWITCHING_PROTOCOLS.code()
                     ? UpgradedHttpResponse.unwrap(encodedResponse) : null;
                 if (upgraded != null) {
-                    // the response is a connection to relay, not a body to write: it stays open
-                    switchProtocols(outboundAccess, nettyHttpRequest, NettyMutableHttpResponse.toNoBodyResponse(encodedResponse), upgraded);
+                    // the response is a connection to relay, not a body to write: it stays open. The
+                    // switch waits for the responses of earlier pipelined requests
+                    io.netty.handler.codec.http.HttpResponse head = NettyMutableHttpResponse.toNoBodyResponse(encodedResponse);
+                    outboundAccess.runInResponseOrder(
+                        () -> switchProtocols(outboundAccess, nettyHttpRequest, head, upgraded),
+                        upgraded::close
+                    );
                     return;
                 }
                 try (encodedResponse) {
@@ -517,6 +547,10 @@ public final class RoutingInBoundHandler implements RequestHandler {
                         u.addSuppressed(t);
                     }
                     t = u;
+                    nettyHttpRequest.responseFailed(u);
+                    // the response may not have reached the connection: the client would wait
+                    // for it until it times out
+                    writeFallbackResponse(outboundAccess, u);
                 }
                 if (t != null) {
                     LOG.warn("Failed to build error response", t);
@@ -583,6 +617,32 @@ public final class RoutingInBoundHandler implements RequestHandler {
             }
             cleanupRequest(request);
         });
+    }
+
+    /**
+     * Answer with an empty {@code 500} response and close the connection, after writing the
+     * response failed, e.g. with an {@link Error} of a buffer allocation. This covers a failure
+     * that is thrown to the caller of {@link OutboundAccess#write}: the work that the connection
+     * does later on its event loop, e.g. when the response is written from another thread, fails
+     * there and is not seen here. If the response was already handed to the connection, so that
+     * a part of it may have been written, this write is refused, and the response is aborted
+     * instead: the connection is closed, or the HTTP/2 stream reset.
+     *
+     * @param outboundAccess The access to the connection
+     * @param failure        The failure of the write, which keeps the failures of this one
+     */
+    static void writeFallbackResponse(OutboundAccess outboundAccess, Throwable failure) {
+        try {
+            outboundAccess.closeAfterWrite();
+            outboundAccess.write(new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR), NettyByteBodyFactory.empty());
+        } catch (Throwable e) {
+            failure.addSuppressed(e);
+            try {
+                outboundAccess.abort();
+            } catch (Throwable g) {
+                failure.addSuppressed(g);
+            }
+        }
     }
 
     ExecutorService getIoExecutor() {

@@ -20,6 +20,7 @@ import io.micronaut.annotation.processing.visitor.JavaElementFactory;
 import io.micronaut.annotation.processing.visitor.JavaNativeElement;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.visitor.VisitorUtils;
+import io.micronaut.core.annotation.Generated;
 import io.micronaut.core.annotation.NextMajorVersion;
 import io.micronaut.core.io.service.SoftServiceLoader;
 import io.micronaut.core.order.OrderUtil;
@@ -41,20 +42,18 @@ import io.micronaut.inject.visitor.ElementPostponedToNextRoundException;
 import io.micronaut.inject.visitor.TypeElementQuery;
 import io.micronaut.inject.visitor.TypeElementVisitor;
 import io.micronaut.inject.visitor.VisitorContext;
+import io.micronaut.inject.visitor.util.ProcessorOptionsSystemProperties;
 import io.micronaut.inject.writer.AbstractBeanDefinitionBuilder;
-import io.micronaut.inject.writer.ByteCodeWriterUtils;
-import io.micronaut.inject.writer.OriginatingElements;
-import io.micronaut.sourcegen.model.ObjectDef;
 import org.jspecify.annotations.Nullable;
 
 import javax.annotation.processing.ProcessingEnvironment;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedOptions;
+import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeMirror;
-import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
@@ -73,8 +72,6 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static io.micronaut.core.util.StringUtils.EMPTY_STRING;
-
 /**
  * <p>The annotation processed used to execute type element visitors.</p>
  *
@@ -91,6 +88,15 @@ import static io.micronaut.core.util.StringUtils.EMPTY_STRING;
 })
 public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcessor {
 
+    /**
+     * The annotations the Python compiler places on the Java classes it generates for the Python classes
+     * and modules of a compilation, which it visits with every visitor before the Java round.
+     */
+    private static final List<String> PYTHON_GENERATED_ANNOTATIONS = List.of(
+        "io.micronaut.context.python.annotation.PythonClass",
+        "io.micronaut.context.python.annotation.PythonModule"
+    );
+    private static final String GENERATED_ANNOTATION = Generated.class.getName();
     private static final Set<String> VISITOR_WARNINGS;
     private static final Set<String> SUPPORTED_ANNOTATION_NAMES;
 
@@ -140,10 +146,8 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
         Collection<? extends TypeElementVisitor<?, ?>> typeElementVisitors = findTypeElementVisitors();
 
         // set supported options as system properties to keep compatibility
-        // in particular for micronaut-openapi
-        processingEnv.getOptions().entrySet().stream()
-            .filter(entry -> entry.getKey() != null && entry.getKey().startsWith(VisitorContext.MICRONAUT_BASE_OPTION_NAME))
-            .forEach(entry -> System.setProperty(entry.getKey(), entry.getValue() == null ? EMPTY_STRING : entry.getValue()));
+        // in particular for micronaut-openapi, they are restored once the processing is over
+        ProcessorOptionsSystemProperties.apply(processingEnv.getElementUtils(), processingEnv.getOptions());
 
         this.loadedVisitors = new ArrayList<>(typeElementVisitors.size());
 
@@ -245,12 +249,17 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
         "It should not be possible to process elements without at least one annotation present and this call breaks that assumption")
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        return ProcessorOptionsSystemProperties.process(processingEnv.getElementUtils(), this, roundEnv.processingOver(), () -> processRound(annotations, roundEnv));
+    }
+
+    private boolean processRound(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
         javaVisitorContext.newRound();
         if (loadedVisitors != null && !loadedVisitors.isEmpty() && !processingGeneratedAnnotation(annotations)) {
 
             TypeElement groovyObjectTypeElement = elementUtils.getTypeElement("groovy.lang.GroovyObject");
             TypeMirror groovyObjectType = groovyObjectTypeElement != null ? groovyObjectTypeElement.asType() : null;
             Predicate<TypeElement> notGroovyObject = typeElement -> groovyObjectType == null || !typeUtils.isAssignable(typeElement.asType(), groovyObjectType);
+            Predicate<TypeElement> visitable = notGroovyObject.and(typeElement -> !isGenerated(typeElement));
 
             var elements = new LinkedHashSet<TypeElement>();
 
@@ -262,12 +271,12 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
                 }
                 modelUtils.resolveTypeElements(
                     roundEnv.getElementsAnnotatedWith(annotation)
-                ).filter(notGroovyObject).forEach(elements::add);
+                ).filter(visitable).forEach(elements::add);
             }
 
             modelUtils.resolveTypeElements(
                 roundEnv.getRootElements()
-            ).filter(notGroovyObject).forEach(elements::add);
+            ).filter(visitable).forEach(elements::add);
 
             for (Object nativeType : postponedTypes.values()) {
                 if (nativeType instanceof Element element) {
@@ -323,7 +332,8 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
                 for (LoadedVisitor loadedVisitor : loadedVisitors) {
                     for (JavaClassElement javaClassElement : javaClassElements) {
                         try {
-                            if (loadedVisitor.matchesClass(javaClassElement)) {
+                            if (loadedVisitor.matchesClass(javaClassElement)
+                                && (loadedVisitor.visitsEveryElement() || !isGeneratedForPython(javaClassElement))) {
                                 visitClass(loadedVisitor, javaClassElement);
                             }
                         } catch (ProcessingException e) {
@@ -342,6 +352,24 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
                 }
             }
 
+            if (!roundEnv.processingOver()) {
+                // nothing generated in the final round is processed, so it is not a round for the visitors
+                for (LoadedVisitor loadedVisitor : loadedVisitors) {
+                    try {
+                        loadedVisitor.getVisitor().finishRound(javaVisitorContext);
+                    } catch (ProcessingException e) {
+                        var originatingElement = (JavaNativeElement) e.getOriginatingElement();
+                        error(originatingElement == null ? null : originatingElement.element(), "%s", e.getMessage());
+                    } catch (Throwable e) {
+                        var stackTraceWriter = new StringWriter();
+                        e.printStackTrace(new PrintWriter(stackTraceWriter));
+
+                        error("Error finishing the round of type visitor [%s]: %s\n%s",
+                            loadedVisitor.getVisitor(), e.getMessage(), stackTraceWriter);
+                    }
+                }
+            }
+
             for (LoadedVisitor loadedVisitor : loadedVisitors) {
                 try {
                     loadedVisitor.getVisitor().finish(javaVisitorContext);
@@ -356,6 +384,9 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
         }
 
         final List<AbstractBeanDefinitionBuilder> beanDefinitionBuilders = javaVisitorContext.getBeanElementBuilders();
+        if (!roundEnv.processingOver() && !postponedTypes.isEmpty()) {
+            removeBeansOfPostponedTypes(beanDefinitionBuilders);
+        }
         if (CollectionUtils.isNotEmpty(beanDefinitionBuilders)) {
             DefaultElementBeanDefinitionBuilderFactory beanDefinitionBuilderFactory = new DefaultElementBeanDefinitionBuilderFactory(javaVisitorContext);
             try {
@@ -375,27 +406,20 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
         return false;
     }
 
-    private void write(OutputObjectDef outputObjectDef, VisitorContext visitorContext) {
-        try {
-            ObjectDef objectDef = outputObjectDef.objectDef();
-            Class<?> serviceClass = outputObjectDef.serviceClass();
-            OriginatingElements originatingElements = outputObjectDef.originatingElements();
-            if (serviceClass != null) {
-                classWriterOutputVisitor.visitServiceDescriptor(serviceClass, objectDef.getName(), originatingElements.getOriginatingElements()[0]);
-            }
-            try (OutputStream outputStream = classWriterOutputVisitor.visitClass(objectDef.getName(), originatingElements.getOriginatingElements())) {
-                outputStream.write(ByteCodeWriterUtils.writeByteCode(objectDef, visitorContext));
-            }
-        } catch (Exception e) {
-            // raise a compile error
-            String message = e.getMessage();
-            Element javaElement = null;
-            io.micronaut.inject.ast.Element astElement = outputObjectDef.originatingElements().getOriginatingElements()[0];
-            if (astElement.getNativeType() instanceof JavaNativeElement javaNativeElement) {
-                javaElement = javaNativeElement.element();
-            }
-            error(javaElement, "Unexpected error: %s", message != null ? message : e.getClass().getSimpleName());
-        }
+    /**
+     * Drops the associated beans added while visiting a type that was then postponed. The type is visited again in
+     * the next round and adds its beans again there, so building them in this round as well would give each of them
+     * two definitions, or the same name twice.
+     *
+     * @param beanDefinitionBuilders The associated beans added in this round
+     */
+    private void removeBeansOfPostponedTypes(List<AbstractBeanDefinitionBuilder> beanDefinitionBuilders) {
+        beanDefinitionBuilders.removeIf(beanDefinitionBuilder -> {
+            io.micronaut.inject.ast.Element originatingElement = beanDefinitionBuilder.getOriginatingElement();
+            // an associated bean is added to a visited class or to one of its methods
+            ClassElement visitedType = originatingElement instanceof MemberElement memberElement ? memberElement.getOwningType() : (ClassElement) originatingElement;
+            return postponedTypes.containsKey(visitedType.getCanonicalName());
+        });
     }
 
     private <T extends Throwable> void postponeElement(JavaClassElement javaClassElement, Element originalElement, T e) throws T {
@@ -404,6 +428,49 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
             throw e;
         }
         postponedTypes.put(javaClassElement.getCanonicalName(), originalElement);
+    }
+
+    /**
+     * Whether the class was generated by Micronaut, a bean definition, an introspection or a type hierarchy record:
+     * javac hands the classes written in a round to the next one as root elements, and a visitor of every class, or
+     * one matching an annotation the generated class carries, would otherwise visit them as classes of the
+     * application, and record or introspect what Micronaut generated for them, round after round. The KSP and Groovy
+     * visitors skip such classes as well. The annotation is checked as declared on the class itself, without building
+     * its metadata.
+     *
+     * @param typeElement The type element
+     * @return Whether the class was generated by Micronaut
+     */
+    private static boolean isGenerated(TypeElement typeElement) {
+        for (AnnotationMirror annotationMirror : typeElement.getAnnotationMirrors()) {
+            if (annotationMirror.getAnnotationType().asElement() instanceof TypeElement annotationType
+                && annotationType.getQualifiedName().contentEquals(GENERATED_ANNOTATION)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the class is the Java class the Python compiler generated for a Python class or module.
+     * The Python compiler ran every visitor on the Python class earlier in the same compilation, and the
+     * generated class carries the runtime annotations of the Python class that reflection-based
+     * frameworks read ({@code micronaut.introspection.allowReflection}, {@code @AllowsReflection}): a
+     * visitor selected by one of those annotations would visit the class a second time and write its
+     * output twice. Only the visitors of every class still visit it, for what the Python compiler added
+     * to the generated class itself ({@code @Introspected} for validation). The annotation is checked as
+     * declared, since it is inherited by the Java subclasses of a Python class, which are visited.
+     *
+     * @param classElement The class element
+     * @return Whether the class was generated by the Python compiler
+     */
+    private static boolean isGeneratedForPython(JavaClassElement classElement) {
+        for (String annotation : PYTHON_GENERATED_ANNOTATIONS) {
+            if (classElement.hasDeclaredAnnotation(annotation)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void visitClass(LoadedVisitor visitor, JavaClassElement classElement) {
