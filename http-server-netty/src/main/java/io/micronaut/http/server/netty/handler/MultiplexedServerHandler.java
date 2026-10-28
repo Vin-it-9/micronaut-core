@@ -125,6 +125,21 @@ abstract class MultiplexedServerHandler {
     }
 
     /**
+     * Convert a response status code to a {@link HttpStatus}, or {@code null} if the code is not
+     * one of the registered statuses.
+     *
+     * @param code The status code
+     * @return The status, or {@code null}
+     */
+    private static @Nullable HttpStatus safeStatusOf(int code) {
+        try {
+            return HttpStatus.valueOf(code);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
      * An HTTP/2 or HTTP/3 stream.
      */
     abstract class MultiplexedStream implements OutboundAccess {
@@ -543,7 +558,7 @@ abstract class MultiplexedServerHandler {
             }
 
             NettyByteBodyFactory byteBodyFactory = byteBodyFactory();
-            capturedStatus = HttpStatus.valueOf(response.status().code());
+            capturedStatus = safeStatusOf(response.status().code());
             if (body instanceof AvailableByteBody available) {
                 writeFull(response, NettyByteBodyFactory.toByteBuf(available));
             } else {
@@ -630,7 +645,7 @@ abstract class MultiplexedServerHandler {
                 return;
             }
 
-            capturedStatus = HttpStatus.valueOf(response.status().code());
+            capturedStatus = safeStatusOf(response.status().code());
 
             // the content that is not handed to the compression or the connection yet
             ByteBuf owned = content;
