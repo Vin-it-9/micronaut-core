@@ -41,6 +41,7 @@ import java.util.concurrent.locks.LockSupport;
 import static io.micronaut.http.tck.TestScenario.asserts;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -62,6 +63,7 @@ public class ResponseWrittenEventTest {
                 AssertionUtils.assertDoesNotThrow(server, request,
                     HttpResponseAssertion.builder().status(HttpStatus.OK).build());
                 RecordedEvent event = awaitSingleEvent(recorder, "/response-written/ok");
+                assertEquals("/response-written/ok", event.request().getPath());
                 assertEquals(HttpStatus.OK, event.status());
                 assertEquals("hello".length(), event.bytesWritten());
             });
@@ -168,6 +170,57 @@ public class ResponseWrittenEventTest {
             });
     }
 
+    @Test
+    void headRequestReportsNoBodyBytes() throws IOException {
+        asserts(SPEC_NAME,
+            HttpRequest.HEAD("/response-written/ok"),
+            (server, request) -> {
+                EventRecorder recorder = recorder(server);
+                AssertionUtils.assertDoesNotThrow(server, request,
+                    HttpResponseAssertion.builder().status(HttpStatus.OK).build());
+                RecordedEvent event = awaitSingleEvent(recorder, "HEAD /response-written/ok");
+                assertEquals(HttpStatus.OK, event.status());
+                assertEquals(0, event.bytesWritten(), "HEAD responses have no body bytes to count");
+            });
+    }
+
+    @Test
+    void eachRequestReportsItsOwnEvent() throws IOException {
+        asserts(SPEC_NAME,
+            HttpRequest.GET("/response-written/ok"),
+            (server, request) -> {
+                EventRecorder recorder = recorder(server);
+                AssertionUtils.assertDoesNotThrow(server, request,
+                    HttpResponseAssertion.builder().status(HttpStatus.OK).build());
+                awaitEventCount(recorder, 1, "first request");
+
+                AssertionUtils.assertDoesNotThrow(server, request,
+                    HttpResponseAssertion.builder().status(HttpStatus.OK).build());
+                awaitEventCount(recorder, 2, "second request");
+
+                assertTrue(recorder.events.stream().allMatch(event -> event.status() == HttpStatus.OK),
+                    "both events must report the response status");
+            });
+    }
+
+    @Test
+    void customStatusCodeIsReportedWithoutFailingTheResponse() throws IOException {
+        asserts(SPEC_NAME,
+            HttpRequest.GET("/response-written/custom-status"),
+            (server, request) -> {
+                EventRecorder recorder = recorder(server);
+                HttpResponse<String> response = server.exchange(request, String.class);
+                assertEquals(299, response.code());
+                assertEquals("custom-status-body", response.body());
+
+                RecordedEvent event = awaitSingleEvent(recorder, "/response-written/custom-status");
+                // HttpStatus is an enum and has no constant for 299. The response and the event
+                // must still be produced; the status is simply unavailable.
+                assertNull(event.status());
+                assertEquals("custom-status-body".length(), event.bytesWritten());
+            });
+    }
+
     private static EventRecorder recorder(ServerUnderTest server) {
         EventRecorder recorder = server.getApplicationContext().getBean(EventRecorder.class);
         recorder.events.clear();
@@ -187,6 +240,18 @@ public class ResponseWrittenEventTest {
         RecordedEvent event = recorder.events.get(0);
         assertNotNull(event.request(), "event source must be the request");
         return event;
+    }
+
+    private static void awaitEventCount(EventRecorder recorder, int expected, String context) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (recorder.events.size() < expected && System.nanoTime() < deadline) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+        }
+        // short grace period to catch extra events
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(200));
+        assertEquals(expected, recorder.events.size(),
+            () -> "expected " + expected + " HttpResponseWrittenEvent(s) for " + context
+                + " but got " + recorder.events.size());
     }
 
     // ------ Infrastructure ------
@@ -235,6 +300,11 @@ public class ResponseWrittenEventTest {
         @Produces(MediaType.TEXT_PLAIN)
         String error() {
             throw new IllegalStateException("test error");
+        }
+
+        @Get("/custom-status")
+        HttpResponse<String> customStatus() {
+            return HttpResponse.status(299, "Custom Status").body("custom-status-body");
         }
     }
 

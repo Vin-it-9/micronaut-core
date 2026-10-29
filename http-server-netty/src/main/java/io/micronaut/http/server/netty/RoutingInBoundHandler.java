@@ -133,8 +133,9 @@ public final class RoutingInBoundHandler implements RequestHandler {
     private final ApplicationContext applicationContext;
     private final ApplicationEventPublisher<HttpResponseWrittenEvent> responseWrittenPublisher;
     /**
-     * Cached result of {@code !responseWrittenPublisher.isEmpty()}. When {@code false}, byte
-     * counting and event publication are skipped entirely — the feature adds zero cost.
+     * Cached result of {@code !responseWrittenPublisher.isEmpty()}. When {@code false}, the event
+     * object is not allocated and no listeners are invoked. The outbound handlers still maintain
+     * the byte counter (one field increment per write) so that the write path stays simple.
      */
     private final boolean hasResponseWrittenListeners;
     private final AsyncRequestBodyFactory asyncBodies;
